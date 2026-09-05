@@ -35,6 +35,7 @@ use crate::types::JsonRpcResponse;
 use crate::Cli;
 use clap::Parser;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 
@@ -144,6 +145,44 @@ async fn bridge_returns_writer_failure() {
         .unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+#[tokio::test]
+async fn writer_failure_cancels_active_prompt_and_waits_for_completion() {
+    // Break caught: returning a writer error before cancelling and draining active prompts.
+    let active = crate::runtime::ActivePrompts::default();
+    let registration = active.register("session-a").unwrap();
+    let cancelled = registration.cancellation_flag();
+    let (done, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    let completion = crate::runtime::PromptCompletion::new(
+        active.clone(),
+        "session-a".to_string(),
+        registration,
+        done,
+    );
+    let prompt = tokio::spawn(async move {
+        while !cancelled.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        drop(completion);
+        true
+    });
+    let writer_result: Result<std::io::Result<()>, tokio::task::JoinError> = Ok(Err(
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "original writer failure"),
+    ));
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        crate::runtime::handle_writer_exit(&active, 1, &mut completions, writer_result),
+    )
+    .await
+    .expect("writer cleanup timed out")
+    .unwrap_err();
+
+    assert!(prompt.await.unwrap());
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    assert_eq!(error.to_string(), "original writer failure");
+    assert!(active.register("session-a").is_ok());
 }
 
 #[test]
@@ -2406,7 +2445,7 @@ fn test_session_resume_returns_models() {
 
 #[test]
 fn test_session_models_json_default() {
-    let mut adapter = Adapter::new();
+    let adapter = Adapter::new();
     let models = adapter.session_models_json(None);
     let current = models["currentModelId"].as_str().unwrap();
     if adapter.available_models.is_empty() {
@@ -2415,6 +2454,23 @@ fn test_session_models_json_default() {
         assert!(!current.is_empty());
         assert!(!current.contains('\t'));
     }
+}
+
+#[test]
+fn model_responses_read_the_initialized_cache_without_mutating_adapter() {
+    // Break caught: lifecycle rendering lazily spawning `agy models` under the adapter lock.
+    let root = fresh_test_root("models-cache-only");
+    let mut initializing_adapter = test_adapter(&root);
+    initializing_adapter.available_models.clear();
+    let adapter = initializing_adapter;
+
+    let models = adapter.session_models_json(None);
+    let config_options = adapter.session_config_options_json(None);
+
+    assert_eq!(models["currentModelId"], "");
+    assert_eq!(models["availableModels"], json!([]));
+    assert_eq!(config_options[0]["currentValue"], "");
+    assert_eq!(config_options[0]["options"], json!([]));
 }
 
 #[test]

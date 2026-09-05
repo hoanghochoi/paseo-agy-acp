@@ -392,9 +392,12 @@ where
 
         tokio::select! {
             writer_result = &mut writer_task => {
-                active.cancel_all();
-                drain_prompt_tasks(pending_prompts, &mut completions).await;
-                return writer_result_to_io(writer_result, true);
+                return handle_writer_exit(
+                    &active,
+                    pending_prompts,
+                    &mut completions,
+                    writer_result,
+                ).await;
             }
             completion = completions.recv(), if pending_prompts > 0 => {
                 if completion.is_some() {
@@ -581,6 +584,17 @@ async fn drain_prompt_tasks(mut pending: usize, completions: &mut mpsc::Unbounde
         }
         pending -= 1;
     }
+}
+
+pub(crate) async fn handle_writer_exit(
+    active: &ActivePrompts,
+    pending_prompts: usize,
+    completions: &mut mpsc::UnboundedReceiver<()>,
+    writer_result: Result<io::Result<()>, tokio::task::JoinError>,
+) -> io::Result<()> {
+    active.cancel_all();
+    drain_prompt_tasks(pending_prompts, completions).await;
+    writer_result_to_io(writer_result, true)
 }
 
 fn writer_result_to_io(

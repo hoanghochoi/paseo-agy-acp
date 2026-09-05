@@ -88,10 +88,7 @@ impl Adapter {
     }
 
     /// Build the ACP `models` JSON for a session, given its current model_id.
-    pub fn session_models_json(&mut self, model_id: Option<&str>) -> Value {
-        if self.available_models.is_empty() {
-            self.available_models = Self::fetch_available_models();
-        }
+    pub fn session_models_json(&self, model_id: Option<&str>) -> Value {
         let current = model_id
             .map(|model| split_model_entry(model).0)
             .or_else(|| {
@@ -118,10 +115,7 @@ impl Adapter {
     }
 
     /// Build the ACP session config option that Zed uses for its model selector.
-    pub fn session_config_options_json(&mut self, model_id: Option<&str>) -> Value {
-        if self.available_models.is_empty() {
-            self.available_models = Self::fetch_available_models();
-        }
+    pub fn session_config_options_json(&self, model_id: Option<&str>) -> Value {
         let current = model_id
             .map(|model| split_model_entry(model).0)
             .or_else(|| {
@@ -151,11 +145,7 @@ impl Adapter {
         }])
     }
 
-    pub fn session_config_result_json(
-        &mut self,
-        session_id: &str,
-        model_id: Option<&str>,
-    ) -> Value {
+    pub fn session_config_result_json(&self, session_id: &str, model_id: Option<&str>) -> Value {
         json!({
             "sessionId": session_id,
             "models": self.session_models_json(model_id),
