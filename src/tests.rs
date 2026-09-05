@@ -6,15 +6,109 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::adapter::{filter_narration, Adapter};
-use crate::protocol::{parse_jsonrpc_line, IncomingMessage};
-use crate::types::JsonRpcResponse;
 use crate::protobuf::{
     extract_text_from_step_payload, extract_thought_from_step_payload,
     extract_title_from_step_payload, extract_tool_name, extract_tool_update_from_step_payload,
     extract_user_text_from_step_payload, is_tool_step_type, read_varint,
 };
+use crate::protocol::{parse_jsonrpc_line, IncomingMessage};
+use crate::types::JsonRpcResponse;
 use crate::Cli;
 use clap::Parser;
+
+fn fresh_test_root(label: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("agy-acp-{label}-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    root
+}
+
+fn test_adapter(root: &std::path::Path) -> Adapter {
+    Adapter {
+        sessions: HashMap::new(),
+        conversations_dir: root.join("conversations"),
+        state_file: root.join("state").join("sessions.json"),
+        available_models: vec!["fake-model\tFake Model".to_string()],
+        skip_naration: false,
+    }
+}
+
+fn session_setup_params(cwd: &std::path::Path) -> Value {
+    json!({"cwd": cwd.to_string_lossy(), "mcpServers": []})
+}
+
+fn open_test_session(adapter: &mut Adapter, cwd: &std::path::Path) -> String {
+    adapter
+        .handle_session_new(json!(1), &session_setup_params(cwd))
+        .result
+        .unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn session_new_rejects_missing_or_relative_cwd() {
+    // Break caught: accepting a session whose workspace cannot be safely scoped.
+    let root = fresh_test_root("bad-cwd");
+    let mut adapter = test_adapter(&root);
+    for params in [
+        json!({"mcpServers": []}),
+        json!({"cwd": "relative", "mcpServers": []}),
+    ] {
+        let response = adapter.handle_session_new(json!(1), &params);
+        assert_eq!(response.error.as_ref().unwrap()["code"], -32602);
+    }
+}
+
+#[test]
+fn session_new_rejects_non_empty_mcp_servers() {
+    // Break caught: silently claiming support for MCP servers that are never forwarded.
+    let root = fresh_test_root("mcp");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    let response = adapter.handle_session_new(
+        json!(1),
+        &json!({"cwd": cwd.to_string_lossy(), "mcpServers": [{"type": "stdio"}]}),
+    );
+    assert_eq!(response.error.as_ref().unwrap()["code"], -32602);
+}
+
+#[test]
+fn session_new_retains_and_persists_cwd() {
+    // Break caught: losing cwd between creation, in-memory execution, and restart.
+    let root = fresh_test_root("persist-cwd");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    let session_id = open_test_session(&mut adapter, &cwd);
+    assert_eq!(adapter.sessions[&session_id].cwd, cwd);
+    assert_eq!(
+        adapter.load_store().sessions[&session_id].cwd.as_deref(),
+        Some(cwd.to_string_lossy().as_ref()),
+    );
+}
+
+#[test]
+fn legacy_stored_session_without_cwd_loads_with_request_cwd() {
+    // Break caught: rejecting pre-cwd state files instead of refreshing their context.
+    let root = fresh_test_root("legacy-cwd");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    fs::create_dir_all(adapter.state_file.parent().unwrap()).unwrap();
+    fs::write(
+        &adapter.state_file,
+        r#"{"sessions":{"legacy":{"conversation_id":"00000000-0000-4000-8000-000000000001","last_step_idx":4,"model_id":null}}}"#,
+    )
+    .unwrap();
+    let mut params = session_setup_params(&cwd);
+    params["sessionId"] = json!("legacy");
+    let output = adapter.handle_session_load(json!(9), &params);
+    let response: Value = serde_json::from_str(output.last().unwrap()).unwrap();
+    assert!(response.get("result").is_some());
+    assert_eq!(adapter.sessions["legacy"].cwd, cwd);
+}
 
 #[test]
 fn malformed_json_returns_parse_error() {
@@ -25,18 +119,17 @@ fn malformed_json_returns_parse_error() {
 
 #[test]
 fn invalid_jsonrpc_envelope_returns_invalid_request() {
-    let error = parse_jsonrpc_line(r#"{"jsonrpc":"1.0","id":7,"method":"initialize"}"#)
-        .unwrap_err();
+    let error =
+        parse_jsonrpc_line(r#"{"jsonrpc":"1.0","id":7,"method":"initialize"}"#).unwrap_err();
     assert_eq!(error.id, json!(7));
     assert_eq!(error.error.unwrap()["code"], -32600);
 }
 
 #[test]
 fn parser_distinguishes_request_from_notification() {
-    let request = parse_jsonrpc_line(
-        r#"{"jsonrpc":"2.0","id":null,"method":"initialize","params":{}}"#,
-    )
-    .unwrap();
+    let request =
+        parse_jsonrpc_line(r#"{"jsonrpc":"2.0","id":null,"method":"initialize","params":{}}"#)
+            .unwrap();
     assert!(matches!(
         request,
         IncomingMessage::Request {
@@ -589,17 +682,13 @@ fn test_session_load_restores_persisted_session() {
     let root = std::env::temp_dir().join(format!("agy-acp-load-{}", Uuid::new_v4()));
     let _ = fs::create_dir_all(&root);
 
-    let mut adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: root.to_string_lossy().to_string(),
-        conversations_dir: root.join("conversations"),
-        state_file: root.join("sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let mut adapter = test_adapter(&root);
     adapter.persist_session("sess-1", Some("conv-abc"), 5, None);
 
-    let output = adapter.handle_session_load(json!(7), &json!({"sessionId": "sess-1"}));
+    let output = adapter.handle_session_load(
+        json!(7),
+        &json!({"sessionId": "sess-1", "cwd": root.to_string_lossy(), "mcpServers": []}),
+    );
     let response: Value = serde_json::from_str(output.last().unwrap()).unwrap();
     assert!(response["error"].is_null());
     assert_eq!(
@@ -623,16 +712,12 @@ fn test_session_load_rejects_unknown_session() {
     let root = std::env::temp_dir().join(format!("agy-acp-missing-{}", Uuid::new_v4()));
     let _ = fs::create_dir_all(&root);
 
-    let mut adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: root.to_string_lossy().to_string(),
-        conversations_dir: root.join("conversations"),
-        state_file: root.join("sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let mut adapter = test_adapter(&root);
 
-    let output = adapter.handle_session_load(json!(9), &json!({"sessionId": "missing"}));
+    let output = adapter.handle_session_load(
+        json!(9),
+        &json!({"sessionId": "missing", "cwd": root.to_string_lossy(), "mcpServers": []}),
+    );
     let response: Value = serde_json::from_str(output.last().unwrap()).unwrap();
     assert!(response["result"].is_null());
     assert_eq!(
@@ -737,17 +822,14 @@ fn test_session_load_replays_conversation_history() {
     .unwrap();
     drop(conn);
 
-    let mut adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: root.to_string_lossy().to_string(),
-        conversations_dir: conv_dir,
-        state_file: root.join("sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let mut adapter = test_adapter(&root);
+    adapter.conversations_dir = conv_dir;
     adapter.persist_session("sess-replay", Some("conv-replay"), 9, None);
 
-    let output = adapter.handle_session_load(json!(1), &json!({"sessionId": "sess-replay"}));
+    let output = adapter.handle_session_load(
+        json!(1),
+        &json!({"sessionId": "sess-replay", "cwd": root.to_string_lossy(), "mcpServers": []}),
+    );
 
     assert!(
         output.len() >= 2,
@@ -865,17 +947,13 @@ fn test_session_resume_restores_persisted_session() {
     let root = std::env::temp_dir().join(format!("agy-acp-resume-{}", Uuid::new_v4()));
     let _ = fs::create_dir_all(&root);
 
-    let mut adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: root.to_string_lossy().to_string(),
-        conversations_dir: root.join("conversations"),
-        state_file: root.join("sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let mut adapter = test_adapter(&root);
     adapter.persist_session("sess-r1", Some("conv-xyz"), 3, None);
 
-    let response = adapter.handle_session_resume(json!(10), &json!({"sessionId": "sess-r1"}));
+    let response = adapter.handle_session_resume(
+        json!(10),
+        &json!({"sessionId": "sess-r1", "cwd": root.to_string_lossy(), "mcpServers": []}),
+    );
     assert!(response.error.is_none());
     assert_eq!(
         response
@@ -906,16 +984,12 @@ fn test_session_resume_rejects_unknown_session() {
     let root = std::env::temp_dir().join(format!("agy-acp-resume-miss-{}", Uuid::new_v4()));
     let _ = fs::create_dir_all(&root);
 
-    let mut adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: root.to_string_lossy().to_string(),
-        conversations_dir: root.join("conversations"),
-        state_file: root.join("sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let mut adapter = test_adapter(&root);
 
-    let response = adapter.handle_session_resume(json!(11), &json!({"sessionId": "nope"}));
+    let response = adapter.handle_session_resume(
+        json!(11),
+        &json!({"sessionId": "nope", "cwd": root.to_string_lossy(), "mcpServers": []}),
+    );
     assert!(response.result.is_none());
     assert_eq!(
         response
@@ -946,24 +1020,22 @@ fn test_session_resume_rejects_empty_session_id() {
 
 #[test]
 fn test_session_resume_accepts_in_memory_session() {
-    let mut adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: "/tmp".to_string(),
-        conversations_dir: PathBuf::from("/tmp/conversations"),
-        state_file: PathBuf::from("/tmp/nonexistent-agy-acp-sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let root = fresh_test_root("resume-memory");
+    let mut adapter = test_adapter(&root);
     adapter.sessions.insert(
         "sess-memory".to_string(),
         crate::types::Session {
             conversation_id: None,
             last_step_idx: -1,
             model_id: None,
+            cwd: root.clone(),
         },
     );
 
-    let response = adapter.handle_session_resume(json!(12), &json!({"sessionId": "sess-memory"}));
+    let response = adapter.handle_session_resume(
+        json!(12),
+        &json!({"sessionId": "sess-memory", "cwd": root.to_string_lossy(), "mcpServers": []}),
+    );
 
     assert!(response.error.is_none());
     assert_eq!(
@@ -978,24 +1050,22 @@ fn test_session_resume_accepts_in_memory_session() {
 
 #[test]
 fn test_session_load_accepts_in_memory_session_without_replay() {
-    let mut adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: "/tmp".to_string(),
-        conversations_dir: PathBuf::from("/tmp/conversations"),
-        state_file: PathBuf::from("/tmp/nonexistent-agy-acp-sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let root = fresh_test_root("load-memory");
+    let mut adapter = test_adapter(&root);
     adapter.sessions.insert(
         "sess-memory-load".to_string(),
         crate::types::Session {
             conversation_id: None,
             last_step_idx: -1,
             model_id: None,
+            cwd: root.clone(),
         },
     );
 
-    let output = adapter.handle_session_load(json!(13), &json!({"sessionId": "sess-memory-load"}));
+    let output = adapter.handle_session_load(
+        json!(13),
+        &json!({"sessionId": "sess-memory-load", "cwd": root.to_string_lossy(), "mcpServers": []}),
+    );
 
     assert_eq!(output.len(), 1);
     let response: Value = serde_json::from_str(&output[0]).unwrap();
@@ -1009,17 +1079,13 @@ fn test_session_resume_does_not_replay_history() {
     let root = std::env::temp_dir().join(format!("agy-acp-resume-noreplay-{}", Uuid::new_v4()));
     let _ = fs::create_dir_all(&root);
 
-    let mut adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: root.to_string_lossy().to_string(),
-        conversations_dir: root.join("conversations"),
-        state_file: root.join("sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let mut adapter = test_adapter(&root);
     adapter.persist_session("sess-nr", Some("conv-nr"), 10, None);
 
-    let response = adapter.handle_session_resume(json!(13), &json!({"sessionId": "sess-nr"}));
+    let response = adapter.handle_session_resume(
+        json!(13),
+        &json!({"sessionId": "sess-nr", "cwd": root.to_string_lossy(), "mcpServers": []}),
+    );
     assert!(response.error.is_none());
     assert_eq!(
         response
@@ -1118,18 +1184,19 @@ fn test_persist_and_restore_session() {
     let root = std::env::temp_dir().join(format!("agy-acp-state-{}", Uuid::new_v4()));
     let _ = fs::create_dir_all(&root);
 
-    let adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: root.to_string_lossy().to_string(),
-        conversations_dir: root.join("conversations"),
-        state_file: root.join("sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let adapter = test_adapter(&root);
 
     adapter.persist_session("sess-1", Some("conv-abc"), 7, None);
     let restored = adapter.restore_session("sess-1");
-    assert_eq!(restored, Some(("conv-abc".to_string(), 7, None)));
+    assert_eq!(
+        restored,
+        Some(crate::types::StoredSession {
+            conversation_id: Some("conv-abc".to_string()),
+            last_step_idx: 7,
+            model_id: None,
+            cwd: None,
+        })
+    );
 
     let missing = adapter.restore_session("sess-unknown");
     assert_eq!(missing, None);
@@ -1183,14 +1250,8 @@ fn test_read_response_from_db() {
     .unwrap();
     drop(conn);
 
-    let adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: root.to_string_lossy().to_string(),
-        conversations_dir: conv_dir,
-        state_file: root.join("sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let mut adapter = test_adapter(&root);
+    adapter.conversations_dir = conv_dir;
 
     let result = adapter.read_response_from_db("test-conv", -1);
     assert_eq!(result, Some(("hello world".to_string(), 2)));
@@ -1268,7 +1329,17 @@ fn test_e2e_agy_acp_full_round_trip() {
     let init: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(init["result"]["protocolVersion"], 1);
 
-    let resp = send_and_recv(r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#);
+    let session_new = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/new",
+        "params": {
+            "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+            "mcpServers": [],
+        },
+    })
+    .to_string();
+    let resp = send_and_recv(&session_new);
     let session: Value = serde_json::from_str(&resp).unwrap();
     let session_id = session["result"]["sessionId"].as_str().unwrap();
     assert!(!session_id.is_empty());
@@ -1421,11 +1492,17 @@ fn test_e2e_multi_turn() {
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientName":"e2e","clientVersion":"0.1"}}"#,
     );
 
-    let resp = send_recv(
-        &mut stdin,
-        &mut reader,
-        r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#,
-    );
+    let session_new = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/new",
+        "params": {
+            "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+            "mcpServers": [],
+        },
+    })
+    .to_string();
+    let resp = send_recv(&mut stdin, &mut reader, &session_new);
     let session_id = serde_json::from_str::<Value>(&resp).unwrap()["result"]["sessionId"]
         .as_str()
         .unwrap()
@@ -1472,11 +1549,17 @@ fn test_e2e_session_load() {
         &mut reader,
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientName":"e2e","clientVersion":"0.1"}}"#,
     );
-    let resp = send_recv(
-        &mut stdin,
-        &mut reader,
-        r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#,
-    );
+    let session_new = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/new",
+        "params": {
+            "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+            "mcpServers": [],
+        },
+    })
+    .to_string();
+    let resp = send_recv(&mut stdin, &mut reader, &session_new);
     let session_id = serde_json::from_str::<Value>(&resp).unwrap()["result"]["sessionId"]
         .as_str()
         .unwrap()
@@ -1526,11 +1609,18 @@ fn test_e2e_error_paths() {
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientName":"e2e","clientVersion":"0.1"}}"#,
     );
 
-    let resp = send_recv(
-        &mut stdin,
-        &mut reader,
-        r#"{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"non-existent-session"}}"#,
-    );
+    let session_load = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/load",
+        "params": {
+            "sessionId": "non-existent-session",
+            "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+            "mcpServers": [],
+        },
+    })
+    .to_string();
+    let resp = send_recv(&mut stdin, &mut reader, &session_load);
     let val: Value = serde_json::from_str(&resp).unwrap();
     assert!(
         !val["error"].is_null(),
@@ -1630,14 +1720,8 @@ fn test_read_response_multi_step_no_skip_no_duplicate() {
     .unwrap();
     drop(conn);
 
-    let adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: root.to_string_lossy().to_string(),
-        conversations_dir: conv_dir,
-        state_file: root.join("sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let mut adapter = test_adapter(&root);
+    adapter.conversations_dir = conv_dir;
 
     let result = adapter.read_response_from_db("multi", -1);
     assert_eq!(
@@ -1670,14 +1754,8 @@ fn test_read_response_missing_steps_table() {
         .unwrap();
     drop(conn);
 
-    let adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: root.to_string_lossy().to_string(),
-        conversations_dir: conv_dir,
-        state_file: root.join("sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let mut adapter = test_adapter(&root);
+    adapter.conversations_dir = conv_dir;
 
     let result = adapter.read_response_from_db("empty", -1);
     assert_eq!(result, None);
@@ -1749,8 +1827,9 @@ fn test_filter_narration_all_narration_drops_all() {
 
 #[test]
 fn test_session_new_returns_models() {
-    let mut adapter = Adapter::new();
-    let response = adapter.handle_session_new(json!(1));
+    let root = fresh_test_root("new-models");
+    let mut adapter = test_adapter(&root);
+    let response = adapter.handle_session_new(json!(1), &session_setup_params(&root));
     let result = response.result.as_ref().unwrap();
     assert!(result.get("sessionId").is_some());
     let models = result.get("models").unwrap();
@@ -1767,8 +1846,9 @@ fn test_session_new_returns_models() {
 
 #[test]
 fn test_session_set_model() {
-    let mut adapter = Adapter::new();
-    let new_resp = adapter.handle_session_new(json!(1));
+    let root = fresh_test_root("set-model");
+    let mut adapter = test_adapter(&root);
+    let new_resp = adapter.handle_session_new(json!(1), &session_setup_params(&root));
     let session_id = new_resp.result.as_ref().unwrap()["sessionId"]
         .as_str()
         .unwrap()
@@ -1811,9 +1891,10 @@ fn test_session_set_model_unknown_session() {
 
 #[test]
 fn test_session_set_config_option_sets_model() {
-    let mut adapter = Adapter::new();
+    let root = fresh_test_root("set-config-model");
+    let mut adapter = test_adapter(&root);
     adapter.available_models = vec!["Model A".to_string(), "Model B".to_string()];
-    let new_resp = adapter.handle_session_new(json!(1));
+    let new_resp = adapter.handle_session_new(json!(1), &session_setup_params(&root));
     let session_id = new_resp.result.as_ref().unwrap()["sessionId"]
         .as_str()
         .unwrap()
@@ -1842,8 +1923,9 @@ fn test_session_set_config_option_sets_model() {
 
 #[test]
 fn test_session_set_config_option_rejects_unknown_config() {
-    let mut adapter = Adapter::new();
-    let new_resp = adapter.handle_session_new(json!(1));
+    let root = fresh_test_root("reject-config");
+    let mut adapter = test_adapter(&root);
+    let new_resp = adapter.handle_session_new(json!(1), &session_setup_params(&root));
     let session_id = new_resp.result.as_ref().unwrap()["sessionId"]
         .as_str()
         .unwrap()
@@ -1864,39 +1946,26 @@ fn test_session_set_model_persists() {
     let root = std::env::temp_dir().join(format!("agy-acp-model-persist-{}", Uuid::new_v4()));
     let _ = fs::create_dir_all(&root);
 
-    let mut adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: root.to_string_lossy().to_string(),
-        conversations_dir: root.join("conversations"),
-        state_file: root.join("sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let mut adapter = test_adapter(&root);
 
     adapter.persist_session("sess-m1", Some("conv-m1"), 0, None);
 
-    adapter.restore_session_state("sess-m1");
+    adapter.restore_session_state("sess-m1", Some(root.clone()));
     adapter.handle_session_set_model(
         json!(1),
         &json!({"sessionId": "sess-m1", "modelId": "Claude Opus 4.6 (Thinking)"}),
     );
 
-    let adapter2 = Adapter {
-        sessions: HashMap::new(),
-        working_dir: root.to_string_lossy().to_string(),
-        conversations_dir: root.join("conversations"),
-        state_file: root.join("sessions.json"),
-        available_models: vec![],
-        skip_naration: false,
-    };
+    let adapter2 = test_adapter(&root);
     let restored = adapter2.restore_session("sess-m1");
     assert_eq!(
         restored,
-        Some((
-            "conv-m1".to_string(),
-            0,
-            Some("Claude Opus 4.6 (Thinking)".to_string())
-        ))
+        Some(crate::types::StoredSession {
+            conversation_id: Some("conv-m1".to_string()),
+            last_step_idx: 0,
+            model_id: Some("Claude Opus 4.6 (Thinking)".to_string()),
+            cwd: Some(root.to_string_lossy().to_string()),
+        })
     );
 
     let _ = fs::remove_dir_all(root);
@@ -1904,13 +1973,15 @@ fn test_session_set_model_persists() {
 
 #[test]
 fn test_session_load_returns_models() {
-    let mut adapter = Adapter::new();
+    let root = fresh_test_root("load-models");
+    let mut adapter = test_adapter(&root);
     adapter.sessions.insert(
         "test-load".to_string(),
         crate::types::Session {
             conversation_id: None,
             last_step_idx: -1,
             model_id: Some("Gemini 3.1 Pro (High)".to_string()),
+            cwd: root.clone(),
         },
     );
     adapter.persist_session(
@@ -1921,7 +1992,10 @@ fn test_session_load_returns_models() {
     );
     adapter.sessions.clear();
 
-    let output = adapter.handle_session_load(json!(1), &json!({"sessionId": "test-load"}));
+    let output = adapter.handle_session_load(
+        json!(1),
+        &json!({"sessionId": "test-load", "cwd": root.to_string_lossy(), "mcpServers": []}),
+    );
     let response: Value = serde_json::from_str(output.last().unwrap()).unwrap();
     assert!(
         response["error"].is_null(),
@@ -1941,7 +2015,8 @@ fn test_session_load_returns_models() {
 
 #[test]
 fn test_session_resume_returns_models() {
-    let mut adapter = Adapter::new();
+    let root = fresh_test_root("resume-models");
+    let mut adapter = test_adapter(&root);
     adapter.persist_session(
         "test-resume",
         Some("conv-resume"),
@@ -1950,7 +2025,10 @@ fn test_session_resume_returns_models() {
     );
     adapter.sessions.clear();
 
-    let response = adapter.handle_session_resume(json!(1), &json!({"sessionId": "test-resume"}));
+    let response = adapter.handle_session_resume(
+        json!(1),
+        &json!({"sessionId": "test-resume", "cwd": root.to_string_lossy(), "mcpServers": []}),
+    );
     assert!(response.error.is_none(), "error: {:?}", response.error);
     let models = response.result.as_ref().unwrap()["models"]
         .as_object()
@@ -1992,16 +2070,9 @@ fn test_session_models_json_with_model() {
 
 #[test]
 fn test_session_models_json_splits_agy_model_id_and_label() {
-    let mut adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: "/tmp".to_string(),
-        conversations_dir: PathBuf::from("/tmp/conversations"),
-        state_file: PathBuf::from("/tmp/nonexistent-agy-acp-sessions.json"),
-        available_models: vec![
-            "gemini-3.8-flash-high\tGemini 3.8 Flash (High)".to_string(),
-        ],
-        skip_naration: false,
-    };
+    let root = fresh_test_root("model-label");
+    let mut adapter = test_adapter(&root);
+    adapter.available_models = vec!["gemini-3.8-flash-high\tGemini 3.8 Flash (High)".to_string()];
 
     let models = adapter.session_models_json(None);
 
@@ -2036,16 +2107,9 @@ fn test_session_config_options_json_with_model() {
 
 #[test]
 fn test_session_config_options_split_agy_model_id_and_label() {
-    let mut adapter = Adapter {
-        sessions: HashMap::new(),
-        working_dir: "/tmp".to_string(),
-        conversations_dir: PathBuf::from("/tmp/conversations"),
-        state_file: PathBuf::from("/tmp/nonexistent-agy-acp-sessions.json"),
-        available_models: vec![
-            "gemini-3.8-flash-high\tGemini 3.8 Flash (High)".to_string(),
-        ],
-        skip_naration: false,
-    };
+    let root = fresh_test_root("config-label");
+    let mut adapter = test_adapter(&root);
+    adapter.available_models = vec!["gemini-3.8-flash-high\tGemini 3.8 Flash (High)".to_string()];
 
     let config_options = adapter.session_config_options_json(None);
 

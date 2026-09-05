@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -52,7 +53,7 @@ pub struct SessionStore {
     pub sessions: HashMap<String, StoredSession>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSession {
     pub conversation_id: Option<String>,
     /// Last step idx read from SQLite; used for delta extraction.
@@ -61,6 +62,9 @@ pub struct StoredSession {
     /// Selected model ID for this session.
     #[serde(default)]
     pub model_id: Option<String>,
+    /// Absolute working directory supplied by the ACP lifecycle request.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 pub struct Session {
@@ -69,6 +73,8 @@ pub struct Session {
     pub last_step_idx: i64,
     /// Selected model ID for this session.
     pub model_id: Option<String>,
+    /// Absolute working directory used for this session's `agy` subprocesses.
+    pub cwd: PathBuf,
 }
 
 #[cfg(test)]

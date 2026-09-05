@@ -36,9 +36,7 @@ pub(crate) fn parse_jsonrpc_line(line: &str) -> Result<IncomingMessage, JsonRpcR
         .get("method")
         .and_then(Value::as_str)
         .filter(|method| !method.is_empty())
-        .ok_or_else(|| {
-            JsonRpcResponse::error(candidate_id.clone(), -32600, "Invalid Request")
-        })?
+        .ok_or_else(|| JsonRpcResponse::error(candidate_id.clone(), -32600, "Invalid Request"))?
         .to_string();
     let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
     if !params.is_object() && !params.is_array() {

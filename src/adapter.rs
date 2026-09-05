@@ -19,6 +19,26 @@ use crate::db::read_replay_updates_from_db;
 use crate::streaming::poll_streaming_delta;
 use crate::types::*;
 
+fn validate_session_setup(params: &Value) -> Result<PathBuf, String> {
+    let cwd = params
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .ok_or_else(|| "cwd must be a non-empty absolute directory".to_string())?;
+    let path = PathBuf::from(cwd);
+    if !path.is_absolute() || !path.is_dir() {
+        return Err("cwd must be an existing absolute directory".to_string());
+    }
+    let servers = params
+        .get("mcpServers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "mcpServers must be an array".to_string())?;
+    if !servers.is_empty() {
+        return Err("non-empty mcpServers are not supported by agy-acp".to_string());
+    }
+    Ok(path)
+}
+
 fn split_model_entry(entry: &str) -> (&str, &str) {
     let entry = entry.trim();
     match entry.split_once('\t') {
@@ -31,7 +51,6 @@ fn split_model_entry(entry: &str) -> (&str, &str) {
 
 pub struct Adapter {
     pub sessions: HashMap<String, Session>,
-    pub working_dir: String,
     pub conversations_dir: PathBuf,
     pub state_file: PathBuf,
     pub available_models: Vec<String>,
@@ -52,9 +71,6 @@ impl Adapter {
         let state_dir = PathBuf::from(&home).join(".openab/agy-acp");
         Self {
             sessions: HashMap::new(),
-            working_dir: std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "/tmp".to_string()),
             conversations_dir: PathBuf::from(&home).join(".gemini/antigravity-cli/conversations"),
             state_file: state_dir.join("sessions.json"),
             available_models: Self::fetch_available_models(),
@@ -185,14 +201,10 @@ impl Adapter {
         self.load_store_inner()
     }
 
-    /// Try to restore conversation_id, last_step_idx, and model_id from persisted state.
-    pub fn restore_session(&self, session_id: &str) -> Option<(String, i64, Option<String>)> {
+    /// Restore the complete persisted session, including unbound new sessions.
+    pub fn restore_session(&self, session_id: &str) -> Option<StoredSession> {
         let store = self.load_store();
-        store.sessions.get(session_id).and_then(|s| {
-            s.conversation_id
-                .clone()
-                .map(|cid| (cid, s.last_step_idx, s.model_id.clone()))
-        })
+        store.sessions.get(session_id).cloned()
     }
 
     /// Persist a session binding (read-modify-write under single lock).
@@ -207,12 +219,23 @@ impl Adapter {
             return;
         };
         let mut store = self.load_store_inner();
+        let cwd = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.cwd.to_string_lossy().to_string())
+            .or_else(|| {
+                store
+                    .sessions
+                    .get(session_id)
+                    .and_then(|session| session.cwd.clone())
+            });
         store.sessions.insert(
             session_id.to_string(),
             StoredSession {
                 conversation_id: conversation_id.map(String::from),
                 last_step_idx,
                 model_id: model_id.map(String::from),
+                cwd,
             },
         );
         let tmp = self.state_file.with_extension("tmp");
@@ -277,9 +300,15 @@ impl Adapter {
         }
     }
 
-    pub fn restore_session_state(&mut self, session_id: &str) -> bool {
-        let Some((conversation_id, last_step_idx, model_id)) = self.restore_session(session_id)
-        else {
+    pub fn restore_session_state(
+        &mut self,
+        session_id: &str,
+        cwd_override: Option<PathBuf>,
+    ) -> bool {
+        let Some(stored) = self.restore_session(session_id) else {
+            return false;
+        };
+        let Some(cwd) = cwd_override.or_else(|| stored.cwd.as_deref().map(PathBuf::from)) else {
             return false;
         };
         if !self.sessions.contains_key(session_id) {
@@ -288,9 +317,10 @@ impl Adapter {
         self.sessions.insert(
             session_id.to_string(),
             Session {
-                conversation_id: Some(conversation_id),
-                last_step_idx,
-                model_id,
+                conversation_id: stored.conversation_id,
+                last_step_idx: stored.last_step_idx,
+                model_id: stored.model_id,
+                cwd,
             },
         );
         true
@@ -313,7 +343,11 @@ impl Adapter {
         }
     }
 
-    pub fn handle_session_new(&mut self, id: Value) -> JsonRpcResponse {
+    pub fn handle_session_new(&mut self, id: Value, params: &Value) -> JsonRpcResponse {
+        let cwd = match validate_session_setup(params) {
+            Ok(cwd) => cwd,
+            Err(message) => return JsonRpcResponse::error(id, -32602, &message),
+        };
         let session_id = Uuid::new_v4().to_string();
         self.evict_if_needed();
         self.sessions.insert(
@@ -322,15 +356,12 @@ impl Adapter {
                 conversation_id: None,
                 last_step_idx: -1,
                 model_id: None,
+                cwd,
             },
         );
+        self.persist_session(&session_id, None, -1, None);
         let result = self.session_config_result_json(&session_id, None);
-        JsonRpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(result),
-            error: None,
-        }
+        JsonRpcResponse::success(id, result)
     }
 
     pub fn handle_session_load(&mut self, id: Value, params: &Value) -> Vec<String> {
@@ -349,7 +380,18 @@ impl Adapter {
             .unwrap()];
         }
 
-        if !self.sessions.contains_key(session_id) && !self.restore_session_state(session_id) {
+        let cwd = match validate_session_setup(params) {
+            Ok(cwd) => cwd,
+            Err(message) => {
+                return vec![
+                    serde_json::to_string(&JsonRpcResponse::error(id, -32602, &message)).unwrap(),
+                ]
+            }
+        };
+
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.cwd = cwd.clone();
+        } else if !self.restore_session_state(session_id, Some(cwd)) {
             return vec![serde_json::to_string(&JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -361,6 +403,21 @@ impl Adapter {
             })
             .unwrap()];
         }
+
+        let (conversation_id, last_step_idx, model_id) = {
+            let session = &self.sessions[session_id];
+            (
+                session.conversation_id.clone(),
+                session.last_step_idx,
+                session.model_id.clone(),
+            )
+        };
+        self.persist_session(
+            session_id,
+            conversation_id.as_deref(),
+            last_step_idx,
+            model_id.as_deref(),
+        );
 
         let mut output_lines: Vec<String> = Vec::new();
 
@@ -432,7 +489,32 @@ impl Adapter {
             };
         }
 
-        if self.sessions.contains_key(session_id) || self.restore_session_state(session_id) {
+        let cwd = match validate_session_setup(params) {
+            Ok(cwd) => cwd,
+            Err(message) => return JsonRpcResponse::error(id, -32602, &message),
+        };
+
+        let found = if let Some(session) = self.sessions.get_mut(session_id) {
+            session.cwd = cwd.clone();
+            true
+        } else {
+            self.restore_session_state(session_id, Some(cwd))
+        };
+        if found {
+            let (conversation_id, last_step_idx, model_id) = {
+                let session = &self.sessions[session_id];
+                (
+                    session.conversation_id.clone(),
+                    session.last_step_idx,
+                    session.model_id.clone(),
+                )
+            };
+            self.persist_session(
+                session_id,
+                conversation_id.as_deref(),
+                last_step_idx,
+                model_id.as_deref(),
+            );
             let model_id = self
                 .sessions
                 .get(session_id)
@@ -474,7 +556,7 @@ impl Adapter {
         }
 
         if !self.sessions.contains_key(session_id) {
-            let _ = self.restore_session_state(session_id);
+            let _ = self.restore_session_state(session_id, None);
         }
 
         let Some(session) = self.sessions.get_mut(session_id) else {
@@ -548,7 +630,7 @@ impl Adapter {
         }
 
         if !self.sessions.contains_key(session_id) {
-            let _ = self.restore_session_state(session_id);
+            let _ = self.restore_session_state(session_id, None);
         }
 
         let Some(session) = self.sessions.get_mut(session_id) else {
@@ -596,8 +678,21 @@ impl Adapter {
             .unwrap_or("");
 
         if !session_id.is_empty() && !self.sessions.contains_key(session_id) {
-            let _ = self.restore_session_state(session_id);
+            let _ = self.restore_session_state(session_id, None);
         }
+
+        let Some(working_dir) = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.cwd.clone())
+        else {
+            return vec![serde_json::to_string(&JsonRpcResponse::error(
+                id,
+                -32000,
+                &format!("unknown sessionId: {session_id}"),
+            ))
+            .unwrap()];
+        };
 
         let prompt_text = params
             .get("prompt")
@@ -632,7 +727,7 @@ impl Adapter {
 
         let mut args: Vec<String> = Vec::new();
         args.push("--add-dir".to_string());
-        args.push(self.working_dir.clone());
+        args.push(working_dir.to_string_lossy().to_string());
         args.push("--log-file".to_string());
         args.push(run_log_path.to_string_lossy().to_string());
         args.push("--print-timeout".to_string());
@@ -655,7 +750,7 @@ impl Adapter {
 
         let spawn_result = Command::new("agy")
             .args(&args)
-            .current_dir(&self.working_dir)
+            .current_dir(&working_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

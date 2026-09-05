@@ -80,7 +80,17 @@ Set the `AGY_EXTRA_ARGS` environment variable to pass additional arguments to ev
 
 ## Session Persistence
 
-Sessions are persisted to `~/.openab/agy-acp/sessions.json`. When you resume a session in Zed, `agy-acp` restores the conversation binding and replays the message history from `agy`'s SQLite conversation databases (`~/.gemini/antigravity-cli/conversations/*.db`).
+Sessions are persisted to `~/.openab/agy-acp/sessions.json`, including the absolute working directory supplied by the ACP client. When you resume a session in Zed, `agy-acp` restores the conversation binding and replays the message history from `agy`'s SQLite conversation databases (`~/.gemini/antigravity-cli/conversations/*.db`).
+
+ACP lifecycle requests must include an existing absolute `cwd` and an empty `mcpServers` array. For example:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/absolute/path/to/project","mcpServers":[]}}
+{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"SESSION_ID","cwd":"/absolute/path/to/project","mcpServers":[]}}
+{"jsonrpc":"2.0","id":3,"method":"session/resume","params":{"sessionId":"SESSION_ID","cwd":"/absolute/path/to/project","mcpServers":[]}}
+```
+
+Non-empty `mcpServers` lists are rejected because `agy-acp` does not currently forward external MCP server definitions to `agy`.
 
 ## Debugging
 
