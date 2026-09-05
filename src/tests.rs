@@ -36,6 +36,14 @@ fn session_setup_params(cwd: &std::path::Path) -> Value {
     json!({"cwd": cwd.to_string_lossy(), "mcpServers": []})
 }
 
+fn session_lifecycle_params(session_id: &str, cwd: &std::path::Path) -> Value {
+    json!({
+        "sessionId": session_id,
+        "cwd": cwd.to_string_lossy(),
+        "mcpServers": [],
+    })
+}
+
 fn open_test_session(adapter: &mut Adapter, cwd: &std::path::Path) -> String {
     adapter
         .handle_session_new(json!(1), &session_setup_params(cwd))
@@ -108,6 +116,98 @@ fn legacy_stored_session_without_cwd_loads_with_request_cwd() {
     let response: Value = serde_json::from_str(output.last().unwrap()).unwrap();
     assert!(response.get("result").is_some());
     assert_eq!(adapter.sessions["legacy"].cwd, cwd);
+}
+
+#[test]
+fn session_load_restores_unbound_session_after_restart() {
+    // Break caught: restore filters out persisted sessions until a conversation is bound.
+    let root = fresh_test_root("load-unbound-restart");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let session_id = {
+        let mut adapter = test_adapter(&root);
+        open_test_session(&mut adapter, &cwd)
+    };
+
+    let mut restarted = test_adapter(&root);
+    let output =
+        restarted.handle_session_load(json!(2), &session_lifecycle_params(&session_id, &cwd));
+    let response: Value = serde_json::from_str(output.last().unwrap()).unwrap();
+
+    assert!(response.get("result").is_some(), "response: {response}");
+    assert_eq!(restarted.sessions[&session_id].conversation_id, None);
+    assert_eq!(restarted.sessions[&session_id].cwd, cwd);
+}
+
+#[test]
+fn session_resume_restores_unbound_session_after_restart() {
+    // Break caught: resume treats a persisted unbound session as unknown after restart.
+    let root = fresh_test_root("resume-unbound-restart");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let session_id = {
+        let mut adapter = test_adapter(&root);
+        open_test_session(&mut adapter, &cwd)
+    };
+
+    let mut restarted = test_adapter(&root);
+    let response =
+        restarted.handle_session_resume(json!(2), &session_lifecycle_params(&session_id, &cwd));
+
+    assert!(response.error.is_none(), "error: {:?}", response.error);
+    assert_eq!(restarted.sessions[&session_id].conversation_id, None);
+    assert_eq!(restarted.sessions[&session_id].cwd, cwd);
+}
+
+#[test]
+fn session_load_persists_refreshed_cwd() {
+    // Break caught: load updates cwd only in memory and leaves stale persisted context.
+    let root = fresh_test_root("load-refresh-cwd");
+    let cwd_a = root.join("workspace-a");
+    let cwd_b = root.join("workspace-b");
+    fs::create_dir_all(&cwd_a).unwrap();
+    fs::create_dir_all(&cwd_b).unwrap();
+    let session_id = {
+        let mut adapter = test_adapter(&root);
+        open_test_session(&mut adapter, &cwd_a)
+    };
+
+    let mut restarted = test_adapter(&root);
+    let output =
+        restarted.handle_session_load(json!(2), &session_lifecycle_params(&session_id, &cwd_b));
+    let response: Value = serde_json::from_str(output.last().unwrap()).unwrap();
+    assert!(response.get("result").is_some(), "response: {response}");
+
+    let reread = test_adapter(&root).load_store();
+    assert_eq!(
+        reread.sessions[&session_id].cwd.as_deref(),
+        Some(cwd_b.to_string_lossy().as_ref()),
+    );
+}
+
+#[test]
+fn session_resume_persists_refreshed_cwd() {
+    // Break caught: resume updates cwd only in memory and leaves stale persisted context.
+    let root = fresh_test_root("resume-refresh-cwd");
+    let cwd_a = root.join("workspace-a");
+    let cwd_b = root.join("workspace-b");
+    fs::create_dir_all(&cwd_a).unwrap();
+    fs::create_dir_all(&cwd_b).unwrap();
+    let session_id = {
+        let mut adapter = test_adapter(&root);
+        open_test_session(&mut adapter, &cwd_a)
+    };
+
+    let mut restarted = test_adapter(&root);
+    let response =
+        restarted.handle_session_resume(json!(2), &session_lifecycle_params(&session_id, &cwd_b));
+    assert!(response.error.is_none(), "error: {:?}", response.error);
+
+    let reread = test_adapter(&root).load_store();
+    assert_eq!(
+        reread.sessions[&session_id].cwd.as_deref(),
+        Some(cwd_b.to_string_lossy().as_ref()),
+    );
 }
 
 #[test]
