@@ -77,6 +77,20 @@ pub struct Session {
     pub cwd: PathBuf,
 }
 
+#[derive(Debug)]
+pub(crate) struct PromptExecution {
+    pub id: Value,
+    pub session_id: String,
+    pub prompt_text: String,
+    pub cwd: PathBuf,
+    pub conversation_id: Option<String>,
+    pub model_id: Option<String>,
+    pub initial_step_idx: i64,
+    pub conversations_dir: PathBuf,
+    pub state_dir: PathBuf,
+    pub skip_naration: bool,
+}
+
 #[cfg(test)]
 pub struct ConversationDelta {
     pub text: Option<String>,

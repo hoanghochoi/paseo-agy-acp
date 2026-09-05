@@ -55,6 +55,94 @@ fn open_test_session(adapter: &mut Adapter, cwd: &std::path::Path) -> String {
 }
 
 #[test]
+fn prepare_prompt_rejects_unknown_session_before_log_creation() {
+    // Break caught: invalid sessions creating invocation artifacts before rejection.
+    let root = fresh_test_root("unknown-prompt");
+    let mut adapter = test_adapter(&root);
+    let error = adapter
+        .prepare_prompt(
+            json!(4),
+            &json!({"sessionId": "missing", "prompt": [{"type": "text", "text": "hello"}]}),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.error.as_ref().unwrap()["code"], -32000);
+    assert!(!adapter
+        .state_file
+        .parent()
+        .unwrap()
+        .join("run-logs")
+        .exists());
+}
+
+#[test]
+fn prepare_prompt_rejects_empty_text() {
+    // Break caught: spawning agy with a prompt that is empty after normalization.
+    let root = fresh_test_root("empty-prompt");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    let session_id = open_test_session(&mut adapter, &cwd);
+    let error = adapter
+        .prepare_prompt(
+            json!(5),
+            &json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "  "}]}),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.error.as_ref().unwrap()["code"], -32602);
+}
+
+#[test]
+fn prepare_prompt_rejects_unsupported_or_mixed_content() {
+    // Break caught: silently dropping a non-text block while executing the remaining text.
+    let root = fresh_test_root("mixed-prompt");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    let session_id = open_test_session(&mut adapter, &cwd);
+    let error = adapter
+        .prepare_prompt(
+            json!(6),
+            &json!({"sessionId": session_id, "prompt": [
+                {"type": "text", "text": "hello"},
+                {"type": "image", "data": "AA==", "mimeType": "image/png"}
+            ]}),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.error.as_ref().unwrap()["code"], -32602);
+}
+
+#[test]
+fn prepare_prompt_snapshots_session_cwd_model_and_conversation() {
+    // Break caught: prompt execution rereading mutable session fields after preparation.
+    let root = fresh_test_root("snapshot");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    let session_id = open_test_session(&mut adapter, &cwd);
+    let session = adapter.sessions.get_mut(&session_id).unwrap();
+    session.model_id = Some("fake-model".to_string());
+    session.conversation_id = Some("00000000-0000-4000-8000-000000000002".to_string());
+
+    let execution = adapter
+        .prepare_prompt(
+            json!(7),
+            &json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "hello"}]}),
+        )
+        .unwrap();
+
+    assert_eq!(execution.cwd, cwd);
+    assert_eq!(execution.model_id.as_deref(), Some("fake-model"));
+    assert_eq!(
+        execution.conversation_id.as_deref(),
+        Some("00000000-0000-4000-8000-000000000002")
+    );
+    assert_eq!(execution.prompt_text, "hello");
+}
+
+#[test]
 fn session_new_rejects_missing_or_relative_cwd() {
     // Break caught: accepting a session whose workspace cannot be safely scoped.
     let root = fresh_test_root("bad-cwd");

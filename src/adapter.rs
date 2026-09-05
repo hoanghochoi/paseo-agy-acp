@@ -666,68 +666,130 @@ impl Adapter {
         }
     }
 
-    pub async fn handle_session_prompt(
+    pub(crate) fn prepare_prompt(
         &mut self,
         id: Value,
         params: &Value,
-        cancelled: Arc<AtomicBool>,
-    ) -> Vec<String> {
+    ) -> Result<PromptExecution, JsonRpcResponse> {
         let session_id = params
             .get("sessionId")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
             .unwrap_or("");
 
         if !session_id.is_empty() && !self.sessions.contains_key(session_id) {
             let _ = self.restore_session_state(session_id, None);
         }
 
-        let Some(working_dir) = self
-            .sessions
-            .get(session_id)
-            .map(|session| session.cwd.clone())
-        else {
-            return vec![serde_json::to_string(&JsonRpcResponse::error(
+        let Some(session) = self.sessions.get(session_id) else {
+            return Err(JsonRpcResponse::error(
                 id,
                 -32000,
                 &format!("unknown sessionId: {session_id}"),
-            ))
-            .unwrap()];
+            ));
         };
+        let cwd = session.cwd.clone();
+        let conversation_id = session.conversation_id.clone();
+        let model_id = session.model_id.clone();
+        let initial_step_idx = session.last_step_idx;
 
-        let prompt_text = params
-            .get("prompt")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        let clean_prompt = prompt_text.trim();
+        let Some(blocks) = params.get("prompt").and_then(Value::as_array) else {
+            return Err(JsonRpcResponse::error(
+                id,
+                -32602,
+                "prompt must be an array of text blocks",
+            ));
+        };
+        let mut text_blocks = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("text") {
+                return Err(JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "only text prompt blocks are supported",
+                ));
+            }
+            let Some(text) = block.get("text").and_then(Value::as_str) else {
+                return Err(JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "text prompt blocks must contain string text",
+                ));
+            };
+            text_blocks.push(text);
+        }
+        let prompt_text = text_blocks.join("\n").trim().to_string();
+        if prompt_text.is_empty() {
+            return Err(JsonRpcResponse::error(
+                id,
+                -32602,
+                "prompt text must not be empty",
+            ));
+        }
 
-        let run_logs_dir = self
+        let state_dir = self
             .state_file
             .parent()
             .unwrap_or_else(|| std::path::Path::new("/tmp"))
-            .join("run-logs");
+            .to_path_buf();
+        let run_logs_dir = state_dir.join("run-logs");
         if let Err(error) = fs::create_dir_all(&run_logs_dir) {
-            return vec![serde_json::to_string(&JsonRpcResponse {
-                jsonrpc: "2.0",
+            return Err(JsonRpcResponse::error(
                 id,
-                result: None,
-                error: Some(json!({
-                    "code": -32000,
-                    "message": format!("failed to create agy run-log directory: {error}"),
-                })),
-            })
-            .unwrap()];
+                -32000,
+                &format!("failed to create agy run-log directory: {error}"),
+            ));
         }
+
+        Ok(PromptExecution {
+            id,
+            session_id: session_id.to_string(),
+            prompt_text,
+            cwd,
+            conversation_id,
+            model_id,
+            initial_step_idx,
+            conversations_dir: self.conversations_dir.clone(),
+            state_dir,
+            skip_naration: self.skip_naration,
+        })
+    }
+
+    pub async fn handle_session_prompt(
+        &mut self,
+        id: Value,
+        params: &Value,
+        cancelled: Arc<AtomicBool>,
+    ) -> Vec<String> {
+        let execution = match self.prepare_prompt(id, params) {
+            Ok(execution) => execution,
+            Err(error) => return vec![serde_json::to_string(&error).unwrap()],
+        };
+        self.handle_prepared_prompt(execution, cancelled).await
+    }
+
+    pub(crate) async fn handle_prepared_prompt(
+        &mut self,
+        execution: PromptExecution,
+        cancelled: Arc<AtomicBool>,
+    ) -> Vec<String> {
+        let PromptExecution {
+            id,
+            session_id,
+            prompt_text,
+            cwd,
+            conversation_id,
+            model_id,
+            initial_step_idx,
+            conversations_dir,
+            state_dir,
+            skip_naration,
+        } = execution;
+        let run_logs_dir = state_dir.join("run-logs");
         let run_log_path = run_logs_dir.join(format!("{}.log", Uuid::new_v4()));
 
         let mut args: Vec<String> = Vec::new();
         args.push("--add-dir".to_string());
-        args.push(working_dir.to_string_lossy().to_string());
+        args.push(cwd.to_string_lossy().to_string());
         args.push("--log-file".to_string());
         args.push(run_log_path.to_string_lossy().to_string());
         args.push("--print-timeout".to_string());
@@ -735,22 +797,20 @@ impl Adapter {
         if let Ok(extra) = std::env::var("AGY_EXTRA_ARGS") {
             args.extend(extra.split_whitespace().map(String::from));
         }
-        if let Some(session) = self.sessions.get(session_id) {
-            if let Some(conv_id) = &session.conversation_id {
-                args.push("--conversation".to_string());
-                args.push(conv_id.clone());
-            }
-            if let Some(model_id) = &session.model_id {
-                args.push("--model".to_string());
-                args.push(model_id.clone());
-            }
+        if let Some(conv_id) = &conversation_id {
+            args.push("--conversation".to_string());
+            args.push(conv_id.clone());
+        }
+        if let Some(model_id) = &model_id {
+            args.push("--model".to_string());
+            args.push(model_id.clone());
         }
         args.push("-p".to_string());
-        args.push(clean_prompt.to_string());
+        args.push(prompt_text);
 
         let spawn_result = Command::new("agy")
             .args(&args)
-            .current_dir(&working_dir)
+            .current_dir(&cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -787,17 +847,8 @@ impl Adapter {
             buf
         });
 
-        let initial_conv_id = self
-            .sessions
-            .get(session_id)
-            .and_then(|s| s.conversation_id.clone());
-        let initial_step_idx = self
-            .sessions
-            .get(session_id)
-            .map(|s| s.last_step_idx)
-            .unwrap_or(-1);
         let streaming_state = Arc::new(Mutex::new(StreamingState {
-            conversation_id: initial_conv_id,
+            conversation_id,
             base_step_idx: initial_step_idx,
             last_step_idx: initial_step_idx,
             had_agent_text: false,
@@ -805,13 +856,13 @@ impl Adapter {
             thought_text_lengths: HashMap::new(),
             emitted_tool_steps: HashSet::new(),
             last_title: None,
-            skip_naration: self.skip_naration,
+            skip_naration,
             child_pid: child.id(),
         }));
         let stop_polling = Arc::new(AtomicBool::new(false));
-        let poll_conversations_dir = self.conversations_dir.clone();
+        let poll_conversations_dir = conversations_dir.clone();
         let poll_run_log_path = run_log_path.clone();
-        let poll_session_id = session_id.to_string();
+        let poll_session_id = session_id.clone();
         let poll_state = Arc::clone(&streaming_state);
         let poll_stop = Arc::clone(&stop_polling);
 
@@ -853,9 +904,9 @@ impl Adapter {
         let mut final_lines = Vec::new();
         for attempt in 0..3 {
             let lines = poll_streaming_delta(
-                &self.conversations_dir,
+                &conversations_dir,
                 Some(&run_log_path),
-                session_id,
+                &session_id,
                 &streaming_state,
             );
             final_lines.extend(lines);
@@ -898,7 +949,7 @@ impl Adapter {
         let had_agent_text = state.had_agent_text;
         drop(state);
 
-        if let Some(session) = self.sessions.get_mut(session_id) {
+        if let Some(session) = self.sessions.get_mut(&session_id) {
             if session.conversation_id.is_none() {
                 session.conversation_id = bound_conv_id.clone();
             }
@@ -907,12 +958,8 @@ impl Adapter {
             }
         }
         if bound_conv_id.is_some() {
-            let model_id = self
-                .sessions
-                .get(session_id)
-                .and_then(|s| s.model_id.clone());
             self.persist_session(
-                session_id,
+                &session_id,
                 bound_conv_id.as_deref(),
                 new_step_idx,
                 model_id.as_deref(),
