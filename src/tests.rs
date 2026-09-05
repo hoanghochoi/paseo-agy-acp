@@ -31,7 +31,7 @@ use crate::protobuf::{
     extract_user_text_from_step_payload, is_tool_step_type, read_varint,
 };
 use crate::protocol::{parse_jsonrpc_line, IncomingMessage};
-use crate::types::{CommandSpec, JsonRpcResponse};
+use crate::types::{CommandSpec, JsonRpcResponse, SessionStore, StoredSession};
 use crate::Cli;
 use clap::Parser;
 use std::pin::Pin;
@@ -259,9 +259,13 @@ fn apply_prompt_outcome_keeps_partial_failed_turn_progress() {
         conversation_id: Some("conversation-after-error".to_string()),
         last_step_idx: 9,
         response: JsonRpcResponse::error(json!(8), -32000, "terminal check failed"),
+        run_log_path: root.join("partial-outcome.log"),
+        remove_run_log_on_commit: false,
     };
 
-    adapter.apply_prompt_outcome(&outcome);
+    adapter
+        .apply_prompt_outcome(&outcome)
+        .expect("partial diagnostic progress should persist");
 
     let session = &adapter.sessions[&session_id];
     assert_eq!(
@@ -281,12 +285,129 @@ fn apply_prompt_outcome_never_recreates_a_missing_session() {
         conversation_id: Some("late-conversation".to_string()),
         last_step_idx: 3,
         response: JsonRpcResponse::success(json!(9), json!({"stopReason": "end_turn"})),
+        run_log_path: root.join("missing-outcome.log"),
+        remove_run_log_on_commit: false,
     };
 
-    adapter.apply_prompt_outcome(&outcome);
+    assert!(adapter.apply_prompt_outcome(&outcome).is_err());
 
     assert!(!adapter.sessions.contains_key("removed-session"));
-    assert!(adapter.restore_session("removed-session").is_none());
+    assert!(adapter
+        .restore_session("removed-session")
+        .expect("missing-session lookup should read a valid empty store")
+        .is_none());
+}
+
+#[test]
+fn outcome_persistence_failure_maps_terminal_error_and_retains_run_log() {
+    // Break caught: sending end_turn and deleting diagnostics after state commit failed.
+    let root = fresh_test_root("outcome-persistence-failure");
+    let blocked_parent = root.join("blocked-state-parent");
+    fs::write(&blocked_parent, b"not a directory").unwrap();
+    let run_log_path = root.join("prompt.log");
+    fs::write(&run_log_path, b"diagnostic run log").unwrap();
+    let mut adapter = test_adapter(&root);
+    adapter.state_file = blocked_parent.join("sessions.json");
+    adapter.sessions.insert(
+        "active-session".to_string(),
+        crate::types::Session {
+            conversation_id: None,
+            last_step_idx: -1,
+            model_id: Some("preserved-model".to_string()),
+            cwd: root.clone(),
+        },
+    );
+    let before = adapter.sessions["active-session"].clone();
+    let outcome = crate::runtime::PromptOutcome {
+        session_id: "active-session".to_string(),
+        conversation_id: Some("new-conversation".to_string()),
+        last_step_idx: 12,
+        response: JsonRpcResponse::success(json!(10), json!({"stopReason": "end_turn"})),
+        run_log_path: run_log_path.clone(),
+        remove_run_log_on_commit: true,
+    };
+
+    let response = crate::runtime::finalize_prompt_outcome(&mut adapter, outcome);
+
+    assert_persistence_error(&response);
+    assert_eq!(adapter.sessions["active-session"], before);
+    assert!(run_log_path.exists());
+}
+
+#[test]
+fn late_outcome_updates_evicted_persisted_session_without_reinserting_it() {
+    // Break caught: dropping an active session's late binding after arbitrary cache eviction.
+    let root = fresh_test_root("evicted-outcome");
+    let mut adapter = test_adapter(&root);
+    let mut original_ids = Vec::new();
+    let mut store = SessionStore::default();
+    for index in 0..64 {
+        let session_id = format!("persisted-session-{index}");
+        adapter.sessions.insert(
+            session_id.clone(),
+            crate::types::Session {
+                conversation_id: None,
+                last_step_idx: -1,
+                model_id: Some("preserved-model".to_string()),
+                cwd: root.clone(),
+            },
+        );
+        store.sessions.insert(
+            session_id.clone(),
+            StoredSession {
+                conversation_id: None,
+                last_step_idx: -1,
+                model_id: Some("preserved-model".to_string()),
+                cwd: Some(root.to_string_lossy().to_string()),
+            },
+        );
+        original_ids.push(session_id);
+    }
+    fs::create_dir_all(adapter.state_file.parent().unwrap()).unwrap();
+    fs::write(
+        &adapter.state_file,
+        serde_json::to_vec_pretty(&store).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(adapter.sessions.len(), 64);
+
+    let inserted_id = open_test_session(&mut adapter, &root);
+    assert!(adapter.sessions.contains_key(&inserted_id));
+    let evicted: Vec<_> = original_ids
+        .iter()
+        .filter(|session_id| !adapter.sessions.contains_key(*session_id))
+        .cloned()
+        .collect();
+    assert_eq!(evicted.len(), 1);
+    let victim = &evicted[0];
+    let before = adapter
+        .restore_session(victim)
+        .expect("evicted victim state should be readable")
+        .expect("evicted victim should remain persisted");
+    assert_eq!(before.cwd.as_deref(), Some(root.to_string_lossy().as_ref()));
+    assert_eq!(before.model_id.as_deref(), Some("preserved-model"));
+
+    let outcome = crate::runtime::PromptOutcome {
+        session_id: victim.clone(),
+        conversation_id: Some("late-conversation".to_string()),
+        last_step_idx: 42,
+        response: JsonRpcResponse::success(json!(12), json!({"stopReason": "end_turn"})),
+        run_log_path: root.join("evicted-outcome.log"),
+        remove_run_log_on_commit: false,
+    };
+    adapter
+        .apply_prompt_outcome(&outcome)
+        .expect("persisted evicted session should accept its late outcome");
+
+    let after = adapter
+        .restore_session(victim)
+        .expect("updated victim state should be readable")
+        .expect("updated victim should remain persisted");
+    assert_eq!(after.conversation_id.as_deref(), Some("late-conversation"));
+    assert_eq!(after.last_step_idx, 42);
+    assert_eq!(after.cwd, before.cwd);
+    assert_eq!(after.model_id, before.model_id);
+    assert!(!adapter.sessions.contains_key(victim));
 }
 
 fn fresh_test_root(label: &str) -> PathBuf {
@@ -309,6 +430,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
 }
 Set-Content -LiteralPath $logFile -Value 'Created conversation 00000000-0000-4000-8000-000000000099' -Encoding utf8
 if ($prompt -eq 'slow') { Start-Sleep -Milliseconds 3000 }
+if ($prompt -eq 'fail') { exit 7 }
 [Console]::Out.WriteLine('fake assistant response')
 "#;
 
@@ -334,6 +456,7 @@ if [ "$prompt" = 'slow' ]; then
   printf '%s\n' 'fake assistant response'
   exec sleep 3
 fi
+if [ "$prompt" = 'fail' ]; then exit 7; fi
 printf '%s\n' 'fake assistant response'
 "#;
 
@@ -512,6 +635,50 @@ async fn concurrent_output_is_valid_newline_delimited_json() {
     assert!(line_count >= 2);
 }
 
+#[tokio::test]
+async fn successful_run_log_is_removed_only_after_state_commit() {
+    // Break caught: deleting the run log inside execution before outcome persistence commits.
+    let mut harness = ConcurrentHarness::new("run-log-commit-order");
+    let execution = harness.prepare("session-a", "fast");
+    let outcome = crate::runtime::execute_prompt(
+        execution,
+        Arc::new(AtomicBool::new(false)),
+        harness.output.clone(),
+    )
+    .await;
+    let run_log_path = outcome.run_log_path.clone();
+
+    assert!(outcome.response.error.is_none());
+    assert!(run_log_path.exists());
+
+    let response = crate::runtime::finalize_prompt_outcome(&mut harness.adapter, outcome);
+
+    assert!(response.error.is_none());
+    assert!(!run_log_path.exists());
+}
+
+#[tokio::test]
+async fn failed_process_run_log_is_retained_after_state_commit() {
+    // Break caught: deleting diagnostics for a child process that returned a terminal error.
+    let mut harness = ConcurrentHarness::new("failed-process-run-log");
+    let execution = harness.prepare("session-a", "fail");
+    let outcome = crate::runtime::execute_prompt(
+        execution,
+        Arc::new(AtomicBool::new(false)),
+        harness.output.clone(),
+    )
+    .await;
+    let run_log_path = outcome.run_log_path.clone();
+
+    assert!(outcome.response.error.is_some());
+    assert!(run_log_path.exists());
+
+    let response = crate::runtime::finalize_prompt_outcome(&mut harness.adapter, outcome);
+
+    assert!(response.error.is_some());
+    assert!(run_log_path.exists());
+}
+
 fn test_adapter(root: &std::path::Path) -> Adapter {
     Adapter {
         sessions: HashMap::new(),
@@ -535,6 +702,31 @@ fn session_lifecycle_params(session_id: &str, cwd: &std::path::Path) -> Value {
     })
 }
 
+fn assert_persistence_error(response: &JsonRpcResponse) {
+    assert!(response.result.is_none());
+    assert_eq!(response.error.as_ref().unwrap()["code"], -32603);
+    assert_eq!(
+        response.error.as_ref().unwrap()["message"],
+        "failed to persist session state"
+    );
+}
+
+fn assert_persistence_error_value(response: &Value) {
+    assert!(response["result"].is_null());
+    assert_eq!(response["error"]["code"], -32603);
+    assert_eq!(
+        response["error"]["message"],
+        "failed to persist session state"
+    );
+}
+
+fn write_corrupt_state(adapter: &Adapter) -> Vec<u8> {
+    let bytes = b"{not valid session state".to_vec();
+    fs::create_dir_all(adapter.state_file.parent().unwrap()).unwrap();
+    fs::write(&adapter.state_file, &bytes).unwrap();
+    bytes
+}
+
 fn open_test_session(adapter: &mut Adapter, cwd: &std::path::Path) -> String {
     adapter
         .handle_session_new(json!(1), &session_setup_params(cwd))
@@ -543,6 +735,192 @@ fn open_test_session(adapter: &mut Adapter, cwd: &std::path::Path) -> String {
         .as_str()
         .unwrap()
         .to_string()
+}
+
+#[test]
+fn session_new_fails_closed_when_state_parent_is_a_file() {
+    // Break caught: reporting a new session as successful after state creation failed.
+    let root = fresh_test_root("new-state-parent-file");
+    let blocked_parent = root.join("blocked-state-parent");
+    fs::write(&blocked_parent, b"not a directory").unwrap();
+    let mut adapter = test_adapter(&root);
+    adapter.state_file = blocked_parent.join("sessions.json");
+
+    let response = adapter.handle_session_new(json!(1), &session_setup_params(&root));
+
+    assert_persistence_error(&response);
+    assert!(adapter.sessions.is_empty());
+}
+
+#[test]
+fn session_load_persistence_failure_preserves_memory_and_emits_no_replay() {
+    // Break caught: mutating cwd/cursor or emitting replay before the candidate is durable.
+    let root = fresh_test_root("load-corrupt-state");
+    let old_cwd = root.join("old");
+    let new_cwd = root.join("new");
+    fs::create_dir_all(&old_cwd).unwrap();
+    fs::create_dir_all(&new_cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    fs::create_dir_all(&adapter.conversations_dir).unwrap();
+    let replay_db = adapter.conversations_dir.join("conversation-load.db");
+    let connection = Connection::open(&replay_db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE steps (
+                idx INTEGER PRIMARY KEY,
+                step_type INTEGER NOT NULL,
+                step_payload BLOB NOT NULL
+            )",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 14, ?2)",
+            rusqlite::params![9i64, make_user_payload("replayed prompt")],
+        )
+        .unwrap();
+    drop(connection);
+    adapter.sessions.insert(
+        "load-session".to_string(),
+        crate::types::Session {
+            conversation_id: Some("conversation-load".to_string()),
+            last_step_idx: 7,
+            model_id: Some("old-model".to_string()),
+            cwd: old_cwd.clone(),
+        },
+    );
+    let corrupt_bytes = write_corrupt_state(&adapter);
+
+    let output = adapter.handle_session_load(
+        json!(2),
+        &session_lifecycle_params("load-session", &new_cwd),
+    );
+
+    assert_eq!(output.len(), 1, "replay must not precede durable state");
+    let response: Value = serde_json::from_str(&output[0]).unwrap();
+    assert_persistence_error_value(&response);
+    let session = &adapter.sessions["load-session"];
+    assert_eq!(session.cwd, old_cwd);
+    assert_eq!(session.last_step_idx, 7);
+    assert_eq!(fs::read(&adapter.state_file).unwrap(), corrupt_bytes);
+}
+
+#[test]
+fn session_resume_persistence_failure_preserves_memory() {
+    // Break caught: changing the in-memory cwd before a resume snapshot is durable.
+    let root = fresh_test_root("resume-corrupt-state");
+    let old_cwd = root.join("old");
+    let new_cwd = root.join("new");
+    fs::create_dir_all(&old_cwd).unwrap();
+    fs::create_dir_all(&new_cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    adapter.sessions.insert(
+        "resume-session".to_string(),
+        crate::types::Session {
+            conversation_id: None,
+            last_step_idx: -1,
+            model_id: None,
+            cwd: old_cwd.clone(),
+        },
+    );
+    let corrupt_bytes = write_corrupt_state(&adapter);
+
+    let response = adapter.handle_session_resume(
+        json!(3),
+        &session_lifecycle_params("resume-session", &new_cwd),
+    );
+
+    assert_persistence_error(&response);
+    assert_eq!(adapter.sessions["resume-session"].cwd, old_cwd);
+    assert_eq!(fs::read(&adapter.state_file).unwrap(), corrupt_bytes);
+}
+
+#[test]
+fn session_set_model_persistence_failure_preserves_memory_and_corrupt_store() {
+    // Break caught: overwriting corrupt state and exposing an uncommitted model in memory.
+    let root = fresh_test_root("model-corrupt-state");
+    let mut adapter = test_adapter(&root);
+    adapter.sessions.insert(
+        "model-session".to_string(),
+        crate::types::Session {
+            conversation_id: Some("conversation-model".to_string()),
+            last_step_idx: 4,
+            model_id: Some("old-model".to_string()),
+            cwd: root.clone(),
+        },
+    );
+    let corrupt_bytes = write_corrupt_state(&adapter);
+
+    let response = adapter.handle_session_set_model(
+        json!(4),
+        &json!({"sessionId": "model-session", "modelId": "new-model"}),
+    );
+
+    assert_persistence_error(&response);
+    assert_eq!(
+        adapter.sessions["model-session"].model_id.as_deref(),
+        Some("old-model")
+    );
+    assert_eq!(fs::read(&adapter.state_file).unwrap(), corrupt_bytes);
+}
+
+#[test]
+fn session_set_config_persistence_failure_preserves_memory() {
+    // Break caught: exposing an uncommitted config-option model in memory.
+    let root = fresh_test_root("config-corrupt-state");
+    let mut adapter = test_adapter(&root);
+    adapter.sessions.insert(
+        "config-session".to_string(),
+        crate::types::Session {
+            conversation_id: None,
+            last_step_idx: -1,
+            model_id: Some("old-model".to_string()),
+            cwd: root.clone(),
+        },
+    );
+    write_corrupt_state(&adapter);
+
+    let response = adapter.handle_session_set_config_option(
+        json!(5),
+        &json!({"sessionId": "config-session", "configId": "model", "value": "new-model"}),
+    );
+
+    assert_persistence_error(&response);
+    assert_eq!(
+        adapter.sessions["config-session"].model_id.as_deref(),
+        Some("old-model")
+    );
+}
+
+#[test]
+fn corrupt_store_restore_is_internal_error_not_unknown_session() {
+    // Break caught: treating an unreadable state store as an empty store/unknown session.
+    let root = fresh_test_root("restore-corrupt-state");
+    let mut adapter = test_adapter(&root);
+    write_corrupt_state(&adapter);
+
+    let response = adapter.handle_session_resume(
+        json!(6),
+        &session_lifecycle_params("persisted-session", &root),
+    );
+
+    assert_persistence_error(&response);
+    assert!(adapter.sessions.is_empty());
+}
+
+#[test]
+fn corrupt_state_load_returns_error_and_preserves_original_bytes() {
+    // Break caught: parsing malformed JSON as an empty store that a later write can replace.
+    let root = fresh_test_root("load-corrupt-state-api");
+    let adapter = test_adapter(&root);
+    let corrupt_bytes = write_corrupt_state(&adapter);
+
+    let error = adapter
+        .load_store()
+        .expect_err("corrupt session state must not become an empty store");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(fs::read(&adapter.state_file).unwrap(), corrupt_bytes);
 }
 
 #[test]
@@ -742,7 +1120,12 @@ fn session_new_retains_and_persists_cwd() {
     let session_id = open_test_session(&mut adapter, &cwd);
     assert_eq!(adapter.sessions[&session_id].cwd, cwd);
     assert_eq!(
-        adapter.load_store().sessions[&session_id].cwd.as_deref(),
+        adapter
+            .load_store()
+            .expect("new session state should be readable")
+            .sessions[&session_id]
+            .cwd
+            .as_deref(),
         Some(cwd.to_string_lossy().as_ref()),
     );
 }
@@ -828,7 +1211,9 @@ fn session_load_persists_refreshed_cwd() {
     let response: Value = serde_json::from_str(output.last().unwrap()).unwrap();
     assert!(response.get("result").is_some(), "response: {response}");
 
-    let reread = test_adapter(&root).load_store();
+    let reread = test_adapter(&root)
+        .load_store()
+        .expect("loaded session state should be readable");
     assert_eq!(
         reread.sessions[&session_id].cwd.as_deref(),
         Some(cwd_b.to_string_lossy().as_ref()),
@@ -853,7 +1238,9 @@ fn session_resume_persists_refreshed_cwd() {
         restarted.handle_session_resume(json!(2), &session_lifecycle_params(&session_id, &cwd_b));
     assert!(response.error.is_none(), "error: {:?}", response.error);
 
-    let reread = test_adapter(&root).load_store();
+    let reread = test_adapter(&root)
+        .load_store()
+        .expect("resumed session state should be readable");
     assert_eq!(
         reread.sessions[&session_id].cwd.as_deref(),
         Some(cwd_b.to_string_lossy().as_ref()),
@@ -1433,7 +1820,17 @@ fn test_session_load_restores_persisted_session() {
     let _ = fs::create_dir_all(&root);
 
     let mut adapter = test_adapter(&root);
-    adapter.persist_session("sess-1", Some("conv-abc"), 5, None);
+    adapter
+        .persist_session(
+            "sess-1",
+            &crate::types::Session {
+                conversation_id: Some("conv-abc".to_string()),
+                last_step_idx: 5,
+                model_id: None,
+                cwd: root.clone(),
+            },
+        )
+        .expect("load fixture should persist");
 
     let output = adapter.handle_session_load(
         json!(7),
@@ -1574,7 +1971,17 @@ fn test_session_load_replays_conversation_history() {
 
     let mut adapter = test_adapter(&root);
     adapter.conversations_dir = conv_dir;
-    adapter.persist_session("sess-replay", Some("conv-replay"), 9, None);
+    adapter
+        .persist_session(
+            "sess-replay",
+            &crate::types::Session {
+                conversation_id: Some("conv-replay".to_string()),
+                last_step_idx: 9,
+                model_id: None,
+                cwd: root.clone(),
+            },
+        )
+        .expect("replay fixture should persist");
 
     let output = adapter.handle_session_load(
         json!(1),
@@ -1698,7 +2105,17 @@ fn test_session_resume_restores_persisted_session() {
     let _ = fs::create_dir_all(&root);
 
     let mut adapter = test_adapter(&root);
-    adapter.persist_session("sess-r1", Some("conv-xyz"), 3, None);
+    adapter
+        .persist_session(
+            "sess-r1",
+            &crate::types::Session {
+                conversation_id: Some("conv-xyz".to_string()),
+                last_step_idx: 3,
+                model_id: None,
+                cwd: root.clone(),
+            },
+        )
+        .expect("resume fixture should persist");
 
     let response = adapter.handle_session_resume(
         json!(10),
@@ -1830,7 +2247,17 @@ fn test_session_resume_does_not_replay_history() {
     let _ = fs::create_dir_all(&root);
 
     let mut adapter = test_adapter(&root);
-    adapter.persist_session("sess-nr", Some("conv-nr"), 10, None);
+    adapter
+        .persist_session(
+            "sess-nr",
+            &crate::types::Session {
+                conversation_id: Some("conv-nr".to_string()),
+                last_step_idx: 10,
+                model_id: None,
+                cwd: root.clone(),
+            },
+        )
+        .expect("no-replay fixture should persist");
 
     let response = adapter.handle_session_resume(
         json!(13),
@@ -1936,19 +2363,33 @@ fn test_persist_and_restore_session() {
 
     let adapter = test_adapter(&root);
 
-    adapter.persist_session("sess-1", Some("conv-abc"), 7, None);
-    let restored = adapter.restore_session("sess-1");
+    adapter
+        .persist_session(
+            "sess-1",
+            &crate::types::Session {
+                conversation_id: Some("conv-abc".to_string()),
+                last_step_idx: 7,
+                model_id: None,
+                cwd: root.clone(),
+            },
+        )
+        .expect("session should persist");
+    let restored = adapter
+        .restore_session("sess-1")
+        .expect("persisted state should be readable");
     assert_eq!(
         restored,
         Some(crate::types::StoredSession {
             conversation_id: Some("conv-abc".to_string()),
             last_step_idx: 7,
             model_id: None,
-            cwd: None,
+            cwd: Some(root.to_string_lossy().to_string()),
         })
     );
 
-    let missing = adapter.restore_session("sess-unknown");
+    let missing = adapter
+        .restore_session("sess-unknown")
+        .expect("missing-session lookup should read valid state");
     assert_eq!(missing, None);
 
     let _ = fs::remove_dir_all(root);
@@ -2698,16 +3139,30 @@ fn test_session_set_model_persists() {
 
     let mut adapter = test_adapter(&root);
 
-    adapter.persist_session("sess-m1", Some("conv-m1"), 0, None);
+    adapter
+        .persist_session(
+            "sess-m1",
+            &crate::types::Session {
+                conversation_id: Some("conv-m1".to_string()),
+                last_step_idx: 0,
+                model_id: None,
+                cwd: root.clone(),
+            },
+        )
+        .expect("model fixture should persist");
 
-    adapter.restore_session_state("sess-m1", Some(root.clone()));
+    assert!(adapter
+        .restore_session_state("sess-m1", Some(root.clone()))
+        .expect("model fixture should restore"));
     adapter.handle_session_set_model(
         json!(1),
         &json!({"sessionId": "sess-m1", "modelId": "Claude Opus 4.6 (Thinking)"}),
     );
 
     let adapter2 = test_adapter(&root);
-    let restored = adapter2.restore_session("sess-m1");
+    let restored = adapter2
+        .restore_session("sess-m1")
+        .expect("updated model state should be readable");
     assert_eq!(
         restored,
         Some(crate::types::StoredSession {
@@ -2734,12 +3189,17 @@ fn test_session_load_returns_models() {
             cwd: root.clone(),
         },
     );
-    adapter.persist_session(
-        "test-load",
-        Some("conv-load"),
-        -1,
-        Some("Gemini 3.1 Pro (High)"),
-    );
+    adapter
+        .persist_session(
+            "test-load",
+            &crate::types::Session {
+                conversation_id: Some("conv-load".to_string()),
+                last_step_idx: -1,
+                model_id: Some("Gemini 3.1 Pro (High)".to_string()),
+                cwd: root.clone(),
+            },
+        )
+        .expect("load model fixture should persist");
     adapter.sessions.clear();
 
     let output = adapter.handle_session_load(
@@ -2767,12 +3227,17 @@ fn test_session_load_returns_models() {
 fn test_session_resume_returns_models() {
     let root = fresh_test_root("resume-models");
     let mut adapter = test_adapter(&root);
-    adapter.persist_session(
-        "test-resume",
-        Some("conv-resume"),
-        -1,
-        Some("GPT-OSS 120B (Medium)"),
-    );
+    adapter
+        .persist_session(
+            "test-resume",
+            &crate::types::Session {
+                conversation_id: Some("conv-resume".to_string()),
+                last_step_idx: -1,
+                model_id: Some("GPT-OSS 120B (Medium)".to_string()),
+                cwd: root.clone(),
+            },
+        )
+        .expect("resume model fixture should persist");
     adapter.sessions.clear();
 
     let response = adapter.handle_session_resume(

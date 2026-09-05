@@ -68,6 +68,7 @@ pub struct StoredSession {
     pub cwd: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Session {
     pub conversation_id: Option<String>,
     /// Last step idx read from SQLite.

@@ -2,6 +2,7 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -10,6 +11,30 @@ use crate::db::read_delta_from_db;
 use crate::db::read_replay_updates_from_db;
 use crate::runtime::PromptOutcome;
 use crate::types::*;
+
+const PERSISTENCE_FAILURE_MESSAGE: &str = "failed to persist session state";
+
+fn persistence_error(id: Value) -> JsonRpcResponse {
+    JsonRpcResponse::error(id, -32603, PERSISTENCE_FAILURE_MESSAGE)
+}
+
+fn session_from_stored(stored: StoredSession, cwd: PathBuf) -> Session {
+    Session {
+        conversation_id: stored.conversation_id,
+        last_step_idx: stored.last_step_idx,
+        model_id: stored.model_id,
+        cwd,
+    }
+}
+
+fn stored_session_from_session(session: &Session) -> StoredSession {
+    StoredSession {
+        conversation_id: session.conversation_id.clone(),
+        last_step_idx: session.last_step_idx,
+        model_id: session.model_id.clone(),
+        cwd: Some(session.cwd.to_string_lossy().to_string()),
+    }
+}
 
 fn validate_session_setup(params: &Value) -> Result<PathBuf, String> {
     let cwd = params
@@ -156,78 +181,70 @@ impl Adapter {
     }
 
     /// Acquire exclusive lock on a dedicated lock file for read-write mutual exclusion.
-    fn lock_state_file(&self) -> Option<fs::File> {
+    fn lock_state_file(&self) -> io::Result<fs::File> {
         if let Some(parent) = self.state_file.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent)?;
         }
         let lock_path = self.state_file.with_extension("lock");
         let lock_file = fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(&lock_path)
-            .ok()?;
-        lock_file.lock_exclusive().ok()?;
-        Some(lock_file)
+            .open(&lock_path)?;
+        lock_file.lock_exclusive()?;
+        Ok(lock_file)
     }
 
     /// Load persisted session store (caller must hold lock).
-    fn load_store_inner(&self) -> SessionStore {
-        let Some(file) = fs::File::open(&self.state_file).ok() else {
-            return SessionStore::default();
+    fn load_store_inner(&self) -> io::Result<SessionStore> {
+        let file = match fs::File::open(&self.state_file) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(SessionStore::default())
+            }
+            Err(error) => return Err(error),
         };
-        serde_json::from_reader(&file).unwrap_or_default()
+        serde_json::from_reader(&file)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     /// Load persisted session store with lock.
-    pub fn load_store(&self) -> SessionStore {
-        let _lock = self.lock_state_file();
+    pub fn load_store(&self) -> io::Result<SessionStore> {
+        let _lock = self.lock_state_file()?;
         self.load_store_inner()
     }
 
     /// Restore the complete persisted session, including unbound new sessions.
-    pub fn restore_session(&self, session_id: &str) -> Option<StoredSession> {
-        let store = self.load_store();
-        store.sessions.get(session_id).cloned()
+    pub fn restore_session(&self, session_id: &str) -> io::Result<Option<StoredSession>> {
+        let store = self.load_store()?;
+        Ok(store.sessions.get(session_id).cloned())
     }
 
-    /// Persist a session binding (read-modify-write under single lock).
-    pub fn persist_session(
-        &self,
-        session_id: &str,
-        conversation_id: Option<&str>,
-        last_step_idx: i64,
-        model_id: Option<&str>,
-    ) {
-        let Some(_lock) = self.lock_state_file() else {
-            return;
-        };
-        let mut store = self.load_store_inner();
-        let cwd = self
-            .sessions
-            .get(session_id)
-            .map(|session| session.cwd.to_string_lossy().to_string())
-            .or_else(|| {
-                store
-                    .sessions
-                    .get(session_id)
-                    .and_then(|session| session.cwd.clone())
-            });
-        store.sessions.insert(
-            session_id.to_string(),
-            StoredSession {
-                conversation_id: conversation_id.map(String::from),
-                last_step_idx,
-                model_id: model_id.map(String::from),
-                cwd,
-            },
-        );
+    fn write_store_inner(&self, store: &SessionStore) -> io::Result<()> {
         let tmp = self.state_file.with_extension("tmp");
-        if let Ok(file) = fs::File::create(&tmp) {
-            if serde_json::to_writer_pretty(&file, &store).is_ok() {
-                let _ = fs::rename(&tmp, &self.state_file);
-            }
-        }
+        let mut file = fs::File::create(&tmp)?;
+        serde_json::to_writer_pretty(&mut file, store)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        file.flush()?;
+        fs::rename(&tmp, &self.state_file)
+    }
+
+    fn update_store<F>(&self, update: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut SessionStore) -> io::Result<()>,
+    {
+        let _lock = self.lock_state_file()?;
+        let mut store = self.load_store_inner()?;
+        update(&mut store)?;
+        self.write_store_inner(&store)
+    }
+
+    pub fn persist_session(&self, session_id: &str, session: &Session) -> io::Result<()> {
+        let snapshot = stored_session_from_session(session);
+        self.update_store(|store| {
+            store.sessions.insert(session_id.to_string(), snapshot);
+            Ok(())
+        })
     }
 
     pub fn read_replay_updates_from_db_inner(
@@ -284,30 +301,45 @@ impl Adapter {
         }
     }
 
+    fn candidate_session(
+        &self,
+        session_id: &str,
+        cwd_override: Option<PathBuf>,
+    ) -> io::Result<Option<Session>> {
+        if let Some(session) = self.sessions.get(session_id) {
+            let mut candidate = session.clone();
+            if let Some(cwd) = cwd_override {
+                candidate.cwd = cwd;
+            }
+            return Ok(Some(candidate));
+        }
+
+        let Some(stored) = self.restore_session(session_id)? else {
+            return Ok(None);
+        };
+        let Some(cwd) = cwd_override.or_else(|| stored.cwd.as_deref().map(PathBuf::from)) else {
+            return Ok(None);
+        };
+        Ok(Some(session_from_stored(stored, cwd)))
+    }
+
+    fn install_candidate(&mut self, session_id: &str, candidate: Session) {
+        if !self.sessions.contains_key(session_id) {
+            self.evict_if_needed();
+        }
+        self.sessions.insert(session_id.to_string(), candidate);
+    }
+
     pub fn restore_session_state(
         &mut self,
         session_id: &str,
         cwd_override: Option<PathBuf>,
-    ) -> bool {
-        let Some(stored) = self.restore_session(session_id) else {
-            return false;
+    ) -> io::Result<bool> {
+        let Some(candidate) = self.candidate_session(session_id, cwd_override)? else {
+            return Ok(false);
         };
-        let Some(cwd) = cwd_override.or_else(|| stored.cwd.as_deref().map(PathBuf::from)) else {
-            return false;
-        };
-        if !self.sessions.contains_key(session_id) {
-            self.evict_if_needed();
-        }
-        self.sessions.insert(
-            session_id.to_string(),
-            Session {
-                conversation_id: stored.conversation_id,
-                last_step_idx: stored.last_step_idx,
-                model_id: stored.model_id,
-                cwd,
-            },
-        );
-        true
+        self.install_candidate(session_id, candidate);
+        Ok(true)
     }
 
     pub fn handle_initialize(&self, id: Value) -> JsonRpcResponse {
@@ -333,17 +365,16 @@ impl Adapter {
             Err(message) => return JsonRpcResponse::error(id, -32602, &message),
         };
         let session_id = Uuid::new_v4().to_string();
-        self.evict_if_needed();
-        self.sessions.insert(
-            session_id.clone(),
-            Session {
-                conversation_id: None,
-                last_step_idx: -1,
-                model_id: None,
-                cwd,
-            },
-        );
-        self.persist_session(&session_id, None, -1, None);
+        let candidate = Session {
+            conversation_id: None,
+            last_step_idx: -1,
+            model_id: None,
+            cwd,
+        };
+        if self.persist_session(&session_id, &candidate).is_err() {
+            return persistence_error(id);
+        }
+        self.install_candidate(&session_id, candidate);
         let result = self.session_config_result_json(&session_id, None);
         JsonRpcResponse::success(id, result)
     }
@@ -373,79 +404,56 @@ impl Adapter {
             }
         };
 
-        if let Some(session) = self.sessions.get_mut(session_id) {
-            session.cwd = cwd.clone();
-        } else if !self.restore_session_state(session_id, Some(cwd)) {
-            return vec![serde_json::to_string(&JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: None,
-                error: Some(json!({
-                    "code": -32000,
-                    "message": format!("unknown sessionId: {session_id}"),
-                })),
-            })
-            .unwrap()];
+        let mut candidate = match self.candidate_session(session_id, Some(cwd)) {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => {
+                return vec![serde_json::to_string(&JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(json!({
+                        "code": -32000,
+                        "message": format!("unknown sessionId: {session_id}"),
+                    })),
+                })
+                .unwrap()]
+            }
+            Err(_) => {
+                return vec![serde_json::to_string(&persistence_error(id)).unwrap()];
+            }
+        };
+
+        let replay = candidate
+            .conversation_id
+            .as_deref()
+            .and_then(|conversation_id| self.read_replay_updates_from_db_inner(conversation_id));
+        if let Some((_, max_step_idx)) = &replay {
+            candidate.last_step_idx = *max_step_idx;
         }
 
-        let (conversation_id, last_step_idx, model_id) = {
-            let session = &self.sessions[session_id];
-            (
-                session.conversation_id.clone(),
-                session.last_step_idx,
-                session.model_id.clone(),
-            )
-        };
-        self.persist_session(
-            session_id,
-            conversation_id.as_deref(),
-            last_step_idx,
-            model_id.as_deref(),
-        );
+        if self.persist_session(session_id, &candidate).is_err() {
+            return vec![serde_json::to_string(&persistence_error(id)).unwrap()];
+        }
+        self.install_candidate(session_id, candidate.clone());
 
         let mut output_lines: Vec<String> = Vec::new();
-
-        let replay_conv_id = self
-            .sessions
-            .get(session_id)
-            .and_then(|session| session.conversation_id.clone());
-        if let Some(conv_id) = replay_conv_id {
-            if let Some((updates, max_step_idx)) = self.read_replay_updates_from_db_inner(&conv_id)
-            {
-                for update in updates {
-                    let notification = serde_json::to_string(&JsonRpcNotification {
-                        jsonrpc: "2.0",
-                        method: "session/update".to_string(),
-                        params: json!({
-                            "sessionId": session_id,
-                            "update": update,
-                        }),
-                    })
-                    .unwrap();
-                    output_lines.push(notification);
-                }
-                if let Some(session) = self.sessions.get_mut(session_id) {
-                    session.last_step_idx = max_step_idx;
-                }
-                let model_id = self
-                    .sessions
-                    .get(session_id)
-                    .and_then(|s| s.model_id.clone());
-                self.persist_session(
-                    session_id,
-                    Some(conv_id.as_str()),
-                    max_step_idx,
-                    model_id.as_deref(),
-                );
+        if let Some((updates, _)) = replay {
+            for update in updates {
+                let notification = serde_json::to_string(&JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update".to_string(),
+                    params: json!({
+                        "sessionId": session_id,
+                        "update": update,
+                    }),
+                })
+                .unwrap();
+                output_lines.push(notification);
             }
         }
 
         output_lines.push({
-            let model_id = self
-                .sessions
-                .get(session_id)
-                .and_then(|s| s.model_id.clone());
-            let result = self.session_config_result_json(session_id, model_id.as_deref());
+            let result = self.session_config_result_json(session_id, candidate.model_id.as_deref());
             serde_json::to_string(&JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -478,49 +486,33 @@ impl Adapter {
             Err(message) => return JsonRpcResponse::error(id, -32602, &message),
         };
 
-        let found = if let Some(session) = self.sessions.get_mut(session_id) {
-            session.cwd = cwd.clone();
-            true
-        } else {
-            self.restore_session_state(session_id, Some(cwd))
+        let candidate = match self.candidate_session(session_id, Some(cwd)) {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => {
+                return JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(json!({
+                        "code": -32000,
+                        "message": format!("unknown sessionId: {session_id}"),
+                    })),
+                }
+            }
+            Err(_) => return persistence_error(id),
         };
-        if found {
-            let (conversation_id, last_step_idx, model_id) = {
-                let session = &self.sessions[session_id];
-                (
-                    session.conversation_id.clone(),
-                    session.last_step_idx,
-                    session.model_id.clone(),
-                )
-            };
-            self.persist_session(
-                session_id,
-                conversation_id.as_deref(),
-                last_step_idx,
-                model_id.as_deref(),
-            );
-            let model_id = self
-                .sessions
-                .get(session_id)
-                .and_then(|s| s.model_id.clone());
-            let result = self.session_config_result_json(session_id, model_id.as_deref());
-            return JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(result),
-                error: None,
-            };
-        }
 
-        JsonRpcResponse {
+        if self.persist_session(session_id, &candidate).is_err() {
+            return persistence_error(id);
+        }
+        let result = self.session_config_result_json(session_id, candidate.model_id.as_deref());
+        self.install_candidate(session_id, candidate);
+        return JsonRpcResponse {
             jsonrpc: "2.0",
             id,
-            result: None,
-            error: Some(json!({
-                "code": -32000,
-                "message": format!("unknown sessionId: {session_id}"),
-            })),
-        }
+            result: Some(result),
+            error: None,
+        };
     }
 
     pub fn handle_session_set_model(&mut self, id: Value, params: &Value) -> JsonRpcResponse {
@@ -539,33 +531,27 @@ impl Adapter {
             };
         }
 
-        if !self.sessions.contains_key(session_id) {
-            let _ = self.restore_session_state(session_id, None);
-        }
-
-        let Some(session) = self.sessions.get_mut(session_id) else {
-            return JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: None,
-                error: Some(json!({
-                    "code": -32000,
-                    "message": format!("unknown sessionId: {session_id}"),
-                })),
-            };
+        let mut candidate = match self.candidate_session(session_id, None) {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => {
+                return JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(json!({
+                        "code": -32000,
+                        "message": format!("unknown sessionId: {session_id}"),
+                    })),
+                }
+            }
+            Err(_) => return persistence_error(id),
         };
 
-        session.model_id = Some(model_id.to_string());
-        let model_id_str = session.model_id.clone();
-        let last_step_idx = session.last_step_idx;
-        let conv_id = session.conversation_id.clone();
-
-        self.persist_session(
-            session_id,
-            conv_id.as_deref(),
-            last_step_idx,
-            model_id_str.as_deref(),
-        );
+        candidate.model_id = Some(model_id.to_string());
+        if self.persist_session(session_id, &candidate).is_err() {
+            return persistence_error(id);
+        }
+        self.install_candidate(session_id, candidate);
 
         JsonRpcResponse {
             jsonrpc: "2.0",
@@ -613,33 +599,28 @@ impl Adapter {
             };
         }
 
-        if !self.sessions.contains_key(session_id) {
-            let _ = self.restore_session_state(session_id, None);
-        }
-
-        let Some(session) = self.sessions.get_mut(session_id) else {
-            return JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: None,
-                error: Some(json!({
-                    "code": -32000,
-                    "message": format!("unknown sessionId: {session_id}"),
-                })),
-            };
+        let mut candidate = match self.candidate_session(session_id, None) {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => {
+                return JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(json!({
+                        "code": -32000,
+                        "message": format!("unknown sessionId: {session_id}"),
+                    })),
+                }
+            }
+            Err(_) => return persistence_error(id),
         };
 
-        session.model_id = Some(model_id.to_string());
-        let model_id_str = session.model_id.clone();
-        let last_step_idx = session.last_step_idx;
-        let conv_id = session.conversation_id.clone();
-
-        self.persist_session(
-            session_id,
-            conv_id.as_deref(),
-            last_step_idx,
-            model_id_str.as_deref(),
-        );
+        candidate.model_id = Some(model_id.to_string());
+        if self.persist_session(session_id, &candidate).is_err() {
+            return persistence_error(id);
+        }
+        let model_id_str = candidate.model_id.clone();
+        self.install_candidate(session_id, candidate);
 
         let config_options = self.session_config_options_json(model_id_str.as_deref());
         JsonRpcResponse {
@@ -661,7 +642,9 @@ impl Adapter {
             .unwrap_or("");
 
         if !session_id.is_empty() && !self.sessions.contains_key(session_id) {
-            let _ = self.restore_session_state(session_id, None);
+            if self.restore_session_state(session_id, None).is_err() {
+                return Err(persistence_error(id));
+            }
         }
 
         let Some(session) = self.sessions.get(session_id) else {
@@ -739,27 +722,32 @@ impl Adapter {
         })
     }
 
-    pub(crate) fn apply_prompt_outcome(&mut self, outcome: &PromptOutcome) {
-        let Some(session) = self.sessions.get_mut(&outcome.session_id) else {
-            return;
-        };
+    pub(crate) fn apply_prompt_outcome(&mut self, outcome: &PromptOutcome) -> io::Result<()> {
+        if let Some(session) = self.sessions.get(&outcome.session_id) {
+            let mut candidate = session.clone();
+            if candidate.conversation_id.is_none() {
+                candidate.conversation_id = outcome.conversation_id.clone();
+            }
+            if outcome.conversation_id.is_some() {
+                candidate.last_step_idx = outcome.last_step_idx;
+            }
+            self.persist_session(&outcome.session_id, &candidate)?;
+            self.sessions.insert(outcome.session_id.clone(), candidate);
+            return Ok(());
+        }
 
-        if session.conversation_id.is_none() {
-            session.conversation_id = outcome.conversation_id.clone();
-        }
-        if outcome.conversation_id.is_some() {
-            session.last_step_idx = outcome.last_step_idx;
-        }
-
-        let model_id = session.model_id.clone();
-        if outcome.conversation_id.is_some() {
-            self.persist_session(
-                &outcome.session_id,
-                outcome.conversation_id.as_deref(),
-                outcome.last_step_idx,
-                model_id.as_deref(),
-            );
-        }
+        self.update_store(|store| {
+            let stored = store.sessions.get_mut(&outcome.session_id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "prompt session state is missing")
+            })?;
+            if stored.conversation_id.is_none() {
+                stored.conversation_id = outcome.conversation_id.clone();
+            }
+            if outcome.conversation_id.is_some() {
+                stored.last_step_idx = outcome.last_step_idx;
+            }
+            Ok(())
+        })
     }
 }
 

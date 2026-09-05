@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -146,6 +147,22 @@ pub(crate) struct PromptOutcome {
     pub(crate) conversation_id: Option<String>,
     pub(crate) last_step_idx: i64,
     pub(crate) response: JsonRpcResponse,
+    pub(crate) run_log_path: PathBuf,
+    pub(crate) remove_run_log_on_commit: bool,
+}
+
+pub(crate) fn finalize_prompt_outcome(
+    adapter: &mut Adapter,
+    outcome: PromptOutcome,
+) -> JsonRpcResponse {
+    let response_id = outcome.response.id.clone();
+    if adapter.apply_prompt_outcome(&outcome).is_err() {
+        return JsonRpcResponse::error(response_id, -32603, "failed to persist session state");
+    }
+    if outcome.remove_run_log_on_commit {
+        let _ = fs::remove_file(&outcome.run_log_path);
+    }
+    outcome.response
 }
 
 pub(crate) async fn execute_prompt(
@@ -214,6 +231,8 @@ pub(crate) async fn execute_prompt(
                     -32000,
                     &format!("failed to run agy: {error}"),
                 ),
+                run_log_path,
+                remove_run_log_on_commit: false,
             };
         }
     };
@@ -386,15 +405,15 @@ pub(crate) async fn execute_prompt(
         }
     };
 
-    if response.error.is_none() {
-        let _ = fs::remove_file(&run_log_path);
-    }
+    let remove_run_log_on_commit = response.error.is_none();
 
     PromptOutcome {
         session_id,
         conversation_id: bound_conv_id,
         last_step_idx: new_step_idx,
         response,
+        run_log_path,
+        remove_run_log_on_commit,
     }
 }
 
@@ -559,11 +578,11 @@ async fn dispatch_request(
                                 let _completion = completion;
                                 let outcome =
                                     execute_prompt(execution, cancelled, task_output.clone()).await;
-                                {
+                                let response = {
                                     let mut adapter = task_adapter.lock().await;
-                                    adapter.apply_prompt_outcome(&outcome);
-                                }
-                                let _ = output::send_response(&task_output, outcome.response).await;
+                                    finalize_prompt_outcome(&mut adapter, outcome)
+                                };
+                                let _ = output::send_response(&task_output, response).await;
                             });
                             return true;
                         }
