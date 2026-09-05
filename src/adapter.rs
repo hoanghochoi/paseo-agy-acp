@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -13,6 +15,8 @@ use crate::runtime::PromptOutcome;
 use crate::types::*;
 
 const PERSISTENCE_FAILURE_MESSAGE: &str = "failed to persist session state";
+const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const MODEL_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 fn persistence_error(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::error(id, -32603, PERSISTENCE_FAILURE_MESSAGE)
@@ -121,6 +125,14 @@ fn split_model_entry(entry: &str) -> (&str, &str) {
     }
 }
 
+fn parse_available_models(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
 pub struct Adapter {
     pub sessions: HashMap<String, Session>,
     pub conversations_dir: PathBuf,
@@ -154,19 +166,56 @@ impl Adapter {
 
     /// Run `agy models` and parse the output into a list of model names.
     fn fetch_available_models() -> Vec<String> {
-        std::process::Command::new("agy")
+        let output_path =
+            std::env::temp_dir().join(format!("agy-acp-models-{}.txt", Uuid::new_v4()));
+        let output_file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output_path)
+        {
+            Ok(file) => file,
+            Err(_) => return Vec::new(),
+        };
+        let mut child = match Command::new("agy")
             .arg("models")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default()
+            .stdout(Stdio::from(output_file))
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => {
+                let _ = fs::remove_file(&output_path);
+                return Vec::new();
+            }
+        };
+        let deadline = Instant::now() + MODEL_DISCOVERY_TIMEOUT;
+
+        let models = loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => {
+                    break fs::read(&output_path)
+                        .ok()
+                        .map(|output| parse_available_models(&String::from_utf8_lossy(&output)))
+                        .unwrap_or_default();
+                }
+                Ok(Some(_)) => break Vec::new(),
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Vec::new();
+                }
+                Ok(None) => {
+                    std::thread::sleep(MODEL_DISCOVERY_POLL_INTERVAL);
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Vec::new();
+                }
+            }
+        };
+        let _ = fs::remove_file(output_path);
+        models
     }
 
     /// Build the ACP `models` JSON for a session, given its current model_id.

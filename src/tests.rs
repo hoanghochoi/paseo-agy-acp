@@ -757,6 +757,148 @@ fn fresh_test_root(label: &str) -> PathBuf {
     root
 }
 
+#[test]
+fn adapter_model_discovery_times_out_without_blocking_startup() {
+    let root = fresh_test_root("models-timeout");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_slow_models_stub(&bin_dir);
+
+    let probe = launch_model_discovery_probe("tests::model_discovery_timeout_probe", &bin_dir);
+    assert!(
+        probe.success(),
+        "model discovery timeout probe failed: {probe}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn adapter_model_discovery_keeps_fast_model_output() {
+    let root = fresh_test_root("models-success");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_models_stub(
+        &bin_dir,
+        r#"println!("gemini-fast\tFast Model"); println!("gemini-plain");"#,
+    );
+
+    let probe = launch_model_discovery_probe("tests::model_discovery_success_probe", &bin_dir);
+    assert!(
+        probe.success(),
+        "model discovery success probe failed: {probe}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn model_discovery_timeout_probe() {
+    if std::env::var("AGY_ACP_MODEL_DISCOVERY_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+
+    let bin_dir = PathBuf::from(std::env::var_os("AGY_ACP_MODEL_DISCOVERY_BIN").unwrap());
+    let parent_path = std::env::var_os("AGY_ACP_MODEL_DISCOVERY_PARENT_PATH").unwrap();
+    let path = std::env::join_paths([bin_dir.as_os_str(), parent_path.as_os_str()]).unwrap();
+    std::env::set_var("PATH", path);
+
+    let started = std::time::Instant::now();
+    let adapter = Adapter::new();
+    assert!(
+        adapter.available_models.is_empty(),
+        "timed-out discovery should preserve the empty-model fallback"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "startup model discovery exceeded the timeout budget: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn model_discovery_success_probe() {
+    if std::env::var("AGY_ACP_MODEL_DISCOVERY_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+
+    let bin_dir = PathBuf::from(std::env::var_os("AGY_ACP_MODEL_DISCOVERY_BIN").unwrap());
+    let parent_path = std::env::var_os("AGY_ACP_MODEL_DISCOVERY_PARENT_PATH").unwrap();
+    let path = std::env::join_paths([bin_dir.as_os_str(), parent_path.as_os_str()]).unwrap();
+    std::env::set_var("PATH", path);
+
+    let adapter = Adapter::new();
+    assert_eq!(
+        adapter.available_models,
+        vec![
+            "gemini-fast\tFast Model".to_string(),
+            "gemini-plain".to_string()
+        ]
+    );
+}
+
+fn launch_model_discovery_probe(
+    test_name: &str,
+    bin_dir: &std::path::Path,
+) -> std::process::ExitStatus {
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut probe = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env("AGY_ACP_MODEL_DISCOVERY_PROBE", "1")
+        .env("AGY_ACP_MODEL_DISCOVERY_BIN", bin_dir)
+        .env("AGY_ACP_MODEL_DISCOVERY_PARENT_PATH", original_path)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+
+    loop {
+        match probe.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                panic!("model discovery probe exceeded its 8-second test deadline");
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                panic!("failed to poll model discovery probe: {error}");
+            }
+        }
+    }
+}
+
+fn write_slow_models_stub(bin_dir: &std::path::Path) {
+    write_models_stub(
+        bin_dir,
+        "std::thread::sleep(std::time::Duration::from_millis(7000));",
+    );
+}
+
+fn write_models_stub(bin_dir: &std::path::Path, body: &str) {
+    let source = bin_dir.join("agy-stub.rs");
+    let binary = if cfg!(windows) {
+        bin_dir.join("agy.exe")
+    } else {
+        bin_dir.join("agy")
+    };
+    fs::write(&source, format!("fn main() {{ {body} }}\n")).unwrap();
+    let compile = std::process::Command::new("rustc")
+        .args(["--edition=2021"])
+        .arg(&source)
+        .args(["-o"])
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "failed to build agy model-discovery stub: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+}
+
 #[cfg(windows)]
 const WINDOWS_FAKE_AGY_SCRIPT: &str = r#"
 $logFile = $null

@@ -57,6 +57,6 @@ No separate lint/typecheck/format commands — just `cargo build` and `cargo tes
 - Conversation binding: every `agy` invocation gets a unique `--log-file`; the adapter reads that invocation's `Created conversation <uuid>` record (or its own child PID's open DB as a fallback). Never infer ownership from a process-global directory diff, because parallel invocations can otherwise cross-bind.
 - Final-answer recovery: SQLite provides streaming/tool/history updates, while captured `agy --print` stdout is the fallback when SQLite emitted no assistant text. A successful process with no conversation ID or no assistant response fails closed instead of returning an empty `end_turn`.
 - Turn completion: the bridge raises `agy --print-timeout` to 24 hours by default and treats an observed print timeout or any non-zero `agy` exit as a failed ACP turn, even if partial updates were streamed. It never converts either condition into `end_turn`.
-- `fetch_available_models()` runs `agy models` synchronously during `Adapter::new()`. If `agy` isn't installed, models list is empty (no error).
+- `fetch_available_models()` runs `agy models` synchronously during `Adapter::new()` with a 5-second deadline. If `agy` isn't installed, times out, or exits unsuccessfully, the models list is empty (no error).
 - `session/cancel` is a no-op — always returns `{}`.
 - Both `session/set_model` and `session/setConfigOption` are accepted for model selection.
