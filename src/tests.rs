@@ -3004,6 +3004,24 @@ fn release_binary_path(release_dir: &std::path::Path) -> PathBuf {
     })
 }
 
+fn collect_agent_message_delta(response_text: &mut String, message: &Value) -> bool {
+    let Some(update) = message.pointer("/params/update") else {
+        return false;
+    };
+    if update["sessionUpdate"] != "agent_message_chunk" {
+        return false;
+    }
+    let Some(text) = update["content"]["text"]
+        .as_str()
+        .filter(|text| !text.is_empty())
+    else {
+        return false;
+    };
+
+    response_text.push_str(text);
+    true
+}
+
 #[test]
 fn release_binary_path_uses_host_executable_suffix() {
     // Break caught: invoking the Unix release artifact name on Windows, where cargo emits agy-acp.exe.
@@ -3039,6 +3057,48 @@ fn local_auth_discovery_checks_a_later_environment_root() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn e2e_message_collector_appends_only_assistant_message_deltas() {
+    // Break caught: overwriting an assistant reply with a later thought or tool session update.
+    let mut response_text = String::new();
+    let updates = [
+        json!({
+            "method": "session/update",
+            "params": {"update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "BAN"},
+            }},
+        }),
+        json!({
+            "method": "session/update",
+            "params": {"update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "internal reasoning"},
+            }},
+        }),
+        json!({
+            "method": "session/update",
+            "params": {"update": {
+                "sessionUpdate": "tool_call",
+                "title": "irrelevant tool update",
+            }},
+        }),
+        json!({
+            "method": "session/update",
+            "params": {"update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "ANA"},
+            }},
+        }),
+    ];
+
+    for update in &updates {
+        collect_agent_message_delta(&mut response_text, update);
+    }
+
+    assert_eq!(response_text, "BANANA");
 }
 
 #[test]
@@ -3111,7 +3171,7 @@ fn test_e2e_agy_acp_full_round_trip() {
     stdin.flush().unwrap();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let mut got_notification = false;
+    let mut got_message_update = false;
     let mut response_text = String::new();
     loop {
         if std::time::Instant::now() > deadline {
@@ -3125,11 +3185,7 @@ fn test_e2e_agy_acp_full_round_trip() {
         }
         let msg: Value = serde_json::from_str(line.trim()).unwrap();
         if msg.get("method") == Some(&json!("session/update")) {
-            got_notification = true;
-            response_text = msg["params"]["update"]["content"]["text"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            got_message_update |= collect_agent_message_delta(&mut response_text, &msg);
         }
         if msg.get("id") == Some(&json!(3)) {
             assert!(msg["error"].is_null(), "Got error: {}", msg["error"]);
@@ -3141,7 +3197,10 @@ fn test_e2e_agy_acp_full_round_trip() {
     drop(stdin);
     let _ = child.wait();
 
-    assert!(got_notification, "Expected session/update notification");
+    assert!(
+        got_message_update,
+        "Expected agent_message_chunk notification"
+    );
     let lower = response_text.to_lowercase();
     assert!(
         lower.contains("pong"),
@@ -3213,7 +3272,7 @@ fn send_prompt_wait(
     stdin.flush().unwrap();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let mut notification_text: Option<String> = None;
+    let mut notification_text = String::new();
     loop {
         if std::time::Instant::now() > deadline {
             panic!("Timed out");
@@ -3226,12 +3285,13 @@ fn send_prompt_wait(
         }
         let msg: Value = serde_json::from_str(line.trim()).unwrap();
         if msg.get("method") == Some(&json!("session/update")) {
-            notification_text = msg["params"]["update"]["content"]["text"]
-                .as_str()
-                .map(String::from);
+            collect_agent_message_delta(&mut notification_text, &msg);
         }
         if msg.get("id") == Some(&json!(id)) {
-            return (notification_text, msg);
+            return (
+                (!notification_text.is_empty()).then_some(notification_text),
+                msg,
+            );
         }
     }
 }
