@@ -1851,6 +1851,16 @@ fn make_assistant_payload(text: &str) -> Vec<u8> {
     outer
 }
 
+fn make_assistant_payload_with_thought(text: &str, thought: &str) -> Vec<u8> {
+    let mut inner = Vec::new();
+    push_len_field(&mut inner, 1, text.as_bytes());
+    push_len_field(&mut inner, 3, thought.as_bytes());
+
+    let mut outer = Vec::new();
+    push_len_field(&mut outer, 20, &inner);
+    outer
+}
+
 #[test]
 fn test_parse_skip_naration_flag() {
     assert!(
@@ -1980,6 +1990,124 @@ fn poller_advances_tail_cursor_without_replaying_or_missing_incremental_text() {
     assert_eq!(
         fourth_updates[0]["params"]["update"]["content"]["text"],
         "next"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn poller_prunes_stale_streaming_bookkeeping_after_tail_advance() {
+    let root = std::env::temp_dir().join(format!("agy-acp-stream-memory-{}", Uuid::new_v4()));
+    let conversations_dir = root.join("conversations");
+    fs::create_dir_all(&conversations_dir).unwrap();
+
+    let db_path = conversations_dir.join("conv.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (
+            idx INTEGER PRIMARY KEY,
+            step_type INTEGER NOT NULL,
+            step_payload BLOB
+        )",
+    )
+    .unwrap();
+
+    let rows = vec![
+        (
+            1i64,
+            15i64,
+            make_assistant_payload_with_thought("one", "thought one"),
+        ),
+        (
+            2i64,
+            8i64,
+            make_tool_payload(
+                "call-2",
+                "view_file",
+                r#"{"toolAction":"Read file 2","toolSummary":"Read file 2"}"#,
+                "Read file 2",
+                None,
+            ),
+        ),
+        (
+            3i64,
+            15i64,
+            make_assistant_payload_with_thought("three", "thought three"),
+        ),
+        (
+            4i64,
+            8i64,
+            make_tool_payload(
+                "call-4",
+                "view_file",
+                r#"{"toolAction":"Read file 4","toolSummary":"Read file 4"}"#,
+                "Read file 4",
+                None,
+            ),
+        ),
+        (
+            5i64,
+            15i64,
+            make_assistant_payload_with_thought("five", "thought five"),
+        ),
+        (
+            6i64,
+            8i64,
+            make_tool_payload(
+                "call-6",
+                "view_file",
+                r#"{"toolAction":"Read file 6","toolSummary":"Read file 6"}"#,
+                "Read file 6",
+                None,
+            ),
+        ),
+        (
+            7i64,
+            15i64,
+            make_assistant_payload_with_thought("seven", "thought seven"),
+        ),
+    ];
+    for (idx, step_type, payload) in rows {
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![idx, step_type, payload],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let state = Arc::new(Mutex::new(crate::types::StreamingState {
+        conversation_id: Some("conv".to_string()),
+        base_step_idx: -1,
+        last_step_idx: -1,
+        ..Default::default()
+    }));
+
+    let first = crate::streaming::poll_streaming_delta(&conversations_dir, None, "session", &state);
+    assert!(
+        first.iter().any(|line| line.contains("\"tool_call\"")),
+        "fixture should emit tool updates before checking bookkeeping"
+    );
+
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.base_step_idx, 6);
+    let mut agent_keys: Vec<_> = guard.agent_text_lengths.keys().copied().collect();
+    agent_keys.sort_unstable();
+    assert_eq!(
+        agent_keys,
+        vec![7],
+        "only the current overlap row needs assistant text bookkeeping"
+    );
+    let mut thought_keys: Vec<_> = guard.thought_text_lengths.keys().copied().collect();
+    thought_keys.sort_unstable();
+    assert_eq!(
+        thought_keys,
+        vec![7],
+        "only the current overlap row needs thought bookkeeping"
+    );
+    assert!(
+        guard.emitted_tool_steps.is_empty(),
+        "completed tool rows older than the overlap should not stay resident"
     );
 
     let _ = fs::remove_dir_all(root);

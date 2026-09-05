@@ -145,5 +145,19 @@ pub fn poll_streaming_delta(
     let next_base_step_idx = guard.last_step_idx.saturating_sub(1);
     guard.base_step_idx = guard.base_step_idx.max(next_base_step_idx);
 
+    // Rows at or before the cursor are no longer read by the next poll. Their
+    // bookkeeping can therefore be dropped; retaining it would grow without
+    // bound for long-running turns while providing no replay protection.
+    let overlap_step_idx = guard.base_step_idx;
+    guard
+        .agent_text_lengths
+        .retain(|idx, _| *idx > overlap_step_idx);
+    guard
+        .thought_text_lengths
+        .retain(|idx, _| *idx > overlap_step_idx);
+    guard
+        .emitted_tool_steps
+        .retain(|idx| *idx > overlap_step_idx);
+
     notifications
 }
