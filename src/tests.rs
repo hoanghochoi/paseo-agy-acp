@@ -851,9 +851,13 @@ impl ConcurrentHarness {
     }
 }
 
+// PowerShell fake-child startup has been observed at 2.1–2.8s under parallel Windows load.
+// Keep this bounded while allowing headroom above that measured range.
+const FAKE_RUN_LOG_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn wait_for_fake_run_log(root: &std::path::Path) {
     let run_logs = root.join("state").join("run-logs");
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(FAKE_RUN_LOG_WAIT_TIMEOUT, async {
         loop {
             let started = fs::read_dir(&run_logs)
                 .ok()
@@ -872,6 +876,27 @@ async fn wait_for_fake_run_log(root: &std::path::Path) {
     })
     .await
     .expect("fake agy did not create its invocation log");
+}
+
+#[tokio::test]
+async fn fake_run_log_wait_tolerates_observed_powershell_startup_delay() {
+    // Break caught: treating a Windows fake-child startup delay above two seconds as a failure.
+    let root = fresh_test_root("delayed-fake-run-log");
+    let run_logs = root.join("state").join("run-logs");
+    fs::create_dir_all(&run_logs).unwrap();
+    let run_log = run_logs.join("delayed.log");
+
+    let delayed_writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        fs::write(
+            run_log,
+            "Created conversation 00000000-0000-4000-8000-000000000099\\n",
+        )
+        .unwrap();
+    });
+
+    wait_for_fake_run_log(&root).await;
+    delayed_writer.await.unwrap();
 }
 
 #[tokio::test]
