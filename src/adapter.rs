@@ -563,12 +563,12 @@ impl Adapter {
         }
         let result = self.session_config_result_json(session_id, candidate.model_id.as_deref());
         self.install_candidate(session_id, candidate);
-        return JsonRpcResponse {
+        JsonRpcResponse {
             jsonrpc: "2.0",
             id,
             result: Some(result),
             error: None,
-        };
+        }
     }
 
     pub fn handle_session_set_model(&mut self, id: Value, params: &Value) -> JsonRpcResponse {
@@ -698,10 +698,10 @@ impl Adapter {
             Err(message) => return Err(JsonRpcResponse::error(id, -32602, message)),
         };
 
-        if !self.sessions.contains_key(session_id) {
-            if self.restore_session_state(session_id, None).is_err() {
-                return Err(persistence_error(id));
-            }
+        if !self.sessions.contains_key(session_id)
+            && self.restore_session_state(session_id, None).is_err()
+        {
+            return Err(persistence_error(id));
         }
 
         let Some(session) = self.sessions.get(session_id) else {

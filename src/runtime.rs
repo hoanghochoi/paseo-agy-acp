@@ -23,6 +23,19 @@ use crate::streaming::poll_streaming_delta;
 use crate::types::{JsonRpcNotification, JsonRpcResponse, PromptExecution, StreamingState};
 
 pub(crate) const MAX_RUNTIME_ERROR_MESSAGE_LEN: usize = 256;
+const MIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+pub(crate) fn next_poll_delay(current: Duration, emitted_delta: bool) -> Duration {
+    if emitted_delta {
+        return MIN_POLL_INTERVAL;
+    }
+    current
+        .checked_mul(2)
+        .unwrap_or(MAX_POLL_INTERVAL)
+        .max(MIN_POLL_INTERVAL)
+        .min(MAX_POLL_INTERVAL)
+}
 
 fn run_log_reference(run_log_path: &Path) -> String {
     run_log_path
@@ -296,18 +309,22 @@ pub(crate) async fn execute_prompt(
     let poll_output = output.clone();
 
     let poller = spawn_poller_thread(move || {
+        let mut poll_delay = MIN_POLL_INTERVAL;
         while !poll_stop.load(Ordering::SeqCst) {
+            let mut emitted_delta = false;
             for line in poll_streaming_delta(
                 &poll_conversations_dir,
                 Some(&poll_run_log_path),
                 &poll_session_id,
                 &poll_state,
             ) {
+                emitted_delta = true;
                 if poll_output.blocking_send(line).is_err() {
                     return;
                 }
             }
-            std::thread::sleep(Duration::from_millis(500));
+            poll_delay = next_poll_delay(poll_delay, emitted_delta);
+            std::thread::sleep(poll_delay);
         }
     });
 

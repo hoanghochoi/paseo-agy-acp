@@ -140,5 +140,10 @@ pub fn poll_streaming_delta(
         }
     }
 
+    // Keep one-row overlap: agy may grow the latest payload in place, while the
+    // per-index lengths/title guard above suppresses already emitted content.
+    let next_base_step_idx = guard.last_step_idx.saturating_sub(1);
+    guard.base_step_idx = guard.base_step_idx.max(next_base_step_idx);
+
     notifications
 }

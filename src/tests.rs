@@ -36,7 +36,7 @@ use crate::Cli;
 use clap::Parser;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::AsyncWrite;
@@ -106,6 +106,30 @@ fn active_prompts_completion_guard_cleans_registry_on_drop() {
 
     assert!(active.register("session-a").is_ok());
     assert_eq!(completions.try_recv(), Ok(()));
+}
+
+#[test]
+fn adaptive_poll_delay_backs_off_when_idle_and_resets_on_delta() {
+    assert_eq!(
+        crate::runtime::next_poll_delay(Duration::from_millis(100), false),
+        Duration::from_millis(200)
+    );
+    assert_eq!(
+        crate::runtime::next_poll_delay(Duration::from_millis(200), false),
+        Duration::from_millis(400)
+    );
+    assert_eq!(
+        crate::runtime::next_poll_delay(Duration::from_millis(400), false),
+        Duration::from_millis(500)
+    );
+    assert_eq!(
+        crate::runtime::next_poll_delay(Duration::from_millis(500), false),
+        Duration::from_millis(500)
+    );
+    assert_eq!(
+        crate::runtime::next_poll_delay(Duration::from_millis(500), true),
+        Duration::from_millis(100)
+    );
 }
 
 struct BrokenPipeWriter;
@@ -1860,6 +1884,107 @@ fn make_title_payload(title: &str) -> Vec<u8> {
     outer
 }
 
+#[test]
+fn poller_advances_tail_cursor_without_replaying_or_missing_incremental_text() {
+    let root = std::env::temp_dir().join(format!("agy-acp-stream-cursor-{}", Uuid::new_v4()));
+    let conversations_dir = root.join("conversations");
+    fs::create_dir_all(&conversations_dir).unwrap();
+
+    let db_path = conversations_dir.join("conv.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (
+            idx INTEGER PRIMARY KEY,
+            step_type INTEGER NOT NULL,
+            step_payload BLOB
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 23, ?2)",
+        rusqlite::params![1i64, make_title_payload("Old title")],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 23, ?2)",
+        rusqlite::params![2i64, make_title_payload("Current title")],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
+        rusqlite::params![3i64, make_assistant_payload("hello")],
+    )
+    .unwrap();
+    drop(conn);
+
+    let state = Arc::new(Mutex::new(crate::types::StreamingState {
+        conversation_id: Some("conv".to_string()),
+        base_step_idx: -1,
+        last_step_idx: -1,
+        ..Default::default()
+    }));
+
+    let first = crate::streaming::poll_streaming_delta(&conversations_dir, None, "session", &state);
+    assert_eq!(
+        first.len(),
+        3,
+        "first poll should emit both titles and text"
+    );
+    assert_eq!(
+        state.lock().unwrap().base_step_idx,
+        2,
+        "cursor should retain one-row overlap for in-place payload growth"
+    );
+
+    let second =
+        crate::streaming::poll_streaming_delta(&conversations_dir, None, "session", &state);
+    assert!(
+        second.is_empty(),
+        "a stable database must not replay previously emitted title updates"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE steps SET step_payload = ?1 WHERE idx = 3",
+        rusqlite::params![make_assistant_payload("hello world")],
+    )
+    .unwrap();
+    let third = crate::streaming::poll_streaming_delta(&conversations_dir, None, "session", &state);
+    let third_updates: Vec<Value> = third
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(third_updates.len(), 1);
+    assert_eq!(
+        third_updates[0]["params"]["update"]["sessionUpdate"],
+        "agent_message_chunk"
+    );
+    assert_eq!(
+        third_updates[0]["params"]["update"]["content"]["text"],
+        " world"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
+        rusqlite::params![4i64, make_assistant_payload("next")],
+    )
+    .unwrap();
+    let fourth =
+        crate::streaming::poll_streaming_delta(&conversations_dir, None, "session", &state);
+    let fourth_updates: Vec<Value> = fourth
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(fourth_updates.len(), 1);
+    assert_eq!(
+        fourth_updates[0]["params"]["update"]["content"]["text"],
+        "next"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn make_tool_payload(
     call_id: &str,
     tool_name: &str,
@@ -2468,6 +2593,11 @@ fn test_session_load_replays_conversation_history() {
         rusqlite::params![9i64, make_assistant_payload("second response")],
     )
     .unwrap();
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 23, ?2)",
+        rusqlite::params![10i64, make_title_payload("Replayed conversation")],
+    )
+    .unwrap();
     drop(conn);
 
     let mut adapter = test_adapter(&root);
@@ -2513,6 +2643,10 @@ fn test_session_load_replays_conversation_history() {
         notification["params"]["update"]["title"] == "Run cargo test"
             && notification["params"]["update"]["kind"] == "execute"
     }));
+    assert!(updates.iter().any(|notification| {
+        notification["params"]["update"]["sessionUpdate"] == "session_info_update"
+            && notification["params"]["update"]["title"] == "Replayed conversation"
+    }));
     let replay_kinds: Vec<_> = updates
         .iter()
         .map(|notification| {
@@ -2532,7 +2666,8 @@ fn test_session_load_replays_conversation_history() {
             "agent_thought_chunk",
             "agent_message_chunk",
             "user_message_chunk",
-            "agent_message_chunk"
+            "agent_message_chunk",
+            "session_info_update"
         ]
     );
     let message_updates: Vec<_> = updates

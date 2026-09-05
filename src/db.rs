@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::adapter::filter_narration;
 use crate::protobuf::{
     extract_text_from_step_payload, extract_thought_from_step_payload,
-    extract_tool_update_from_step_payload, extract_user_text_from_step_payload, is_tool_step_type,
-    message_chunk_update,
+    extract_title_from_step_payload, extract_tool_update_from_step_payload,
+    extract_user_text_from_step_payload, is_tool_step_type, message_chunk_update,
 };
 
 #[cfg(test)]
@@ -170,6 +170,15 @@ pub fn read_replay_updates_from_db(
             flush_thought_message(&mut pending_thought_parts, &mut updates);
             if let Some(update) = extract_tool_update_from_step_payload(*idx, *step_type, payload) {
                 updates.push(update);
+            }
+        } else if *step_type == 23 {
+            flush_agent_message(&mut pending_agent_parts, &mut updates, skip_naration);
+            flush_thought_message(&mut pending_thought_parts, &mut updates);
+            if let Some(title) = extract_title_from_step_payload(payload) {
+                updates.push(serde_json::json!({
+                    "sessionUpdate": "session_info_update",
+                    "title": title,
+                }));
             }
         }
     }

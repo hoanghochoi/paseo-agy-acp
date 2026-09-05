@@ -22,9 +22,11 @@ pub(crate) fn parse_jsonrpc_line(line: &str) -> Result<IncomingMessage, JsonRpcR
         .ok_or_else(|| JsonRpcResponse::error(Value::Null, -32600, "Invalid Request"))?;
     let candidate_id = object.get("id").cloned().unwrap_or(Value::Null);
     let valid_id = candidate_id.is_null() || candidate_id.is_string() || candidate_id.is_number();
-    let response_id = valid_id
-        .then_some(candidate_id.clone())
-        .unwrap_or(Value::Null);
+    let response_id = if valid_id {
+        candidate_id.clone()
+    } else {
+        Value::Null
+    };
     if object.get("jsonrpc") != Some(&json!("2.0")) || !valid_id {
         return Err(JsonRpcResponse::error(
             response_id,
