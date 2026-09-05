@@ -3164,7 +3164,7 @@ fn test_e2e_agy_acp_full_round_trip() {
     assert!(!session_id.is_empty());
 
     let prompt_msg = format!(
-        r#"{{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"{}","prompt":[{{"type":"text","text":"Reply with exactly one word: PONG"}}]}}}}"#,
+        r#"{{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"{}","prompt":[{{"type":"text","text":"Answer from this prompt only. Do not call any tools. Reply with exactly one word: PONG."}}]}}}}"#,
         session_id
     );
     writeln!(stdin, "{}", prompt_msg).unwrap();
@@ -3330,7 +3330,7 @@ fn test_e2e_multi_turn() {
         &mut reader,
         3,
         &session_id,
-        "Remember this word: BANANA. Reply OK.",
+        "Remember the word BANANA for this session. Answer from this prompt only, do not call any tools, and reply exactly: OK.",
     );
     assert!(resp1["error"].is_null(), "Turn 1 error: {}", resp1["error"]);
     assert!(text1.is_some());
@@ -3340,7 +3340,7 @@ fn test_e2e_multi_turn() {
         &mut reader,
         4,
         &session_id,
-        "What word did I ask you to remember? Reply with just that word.",
+        "Using only the existing conversation context, do not call any tools. What word did I ask you to remember? Reply with exactly that one word.",
     );
     assert!(resp2["error"].is_null(), "Turn 2 error: {}", resp2["error"]);
     let reply = text2.unwrap_or_default().to_lowercase();
