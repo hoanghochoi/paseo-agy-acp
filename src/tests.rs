@@ -1004,6 +1004,33 @@ async fn failed_process_run_log_is_retained_after_state_commit() {
     assert!(run_log_path.exists());
 }
 
+#[test]
+fn retained_run_log_message_uses_only_a_bounded_bridge_reference() {
+    // Break caught: exposing an unbounded or sensitive parent path in runtime diagnostics.
+    let controlled_name = "00000000-0000-4000-8000-000000000123.log";
+    let untrusted_parent = format!("PARENT_PATH_SENTINEL_{}", "x".repeat(4096));
+    let run_log_path = PathBuf::from(&untrusted_parent).join(controlled_name);
+
+    let message = crate::runtime::retained_run_log_message(
+        "agy completed but no conversation ID was found",
+        &run_log_path,
+    );
+
+    assert!(message.len() <= crate::runtime::MAX_RUNTIME_ERROR_MESSAGE_LEN);
+    assert!(!message.contains("PARENT_PATH_SENTINEL"));
+    assert!(message.ends_with(&format!("run-logs/{controlled_name}")));
+
+    let untrusted_name = format!("UNTRUSTED_FILE_SENTINEL_{}.log", "y".repeat(4096));
+    let fallback = crate::runtime::retained_run_log_message(
+        &"untrusted summary ".repeat(4096),
+        &PathBuf::from(untrusted_parent).join(untrusted_name),
+    );
+    assert!(fallback.len() <= crate::runtime::MAX_RUNTIME_ERROR_MESSAGE_LEN);
+    assert!(!fallback.contains("PARENT_PATH_SENTINEL"));
+    assert!(!fallback.contains("UNTRUSTED_FILE_SENTINEL"));
+    assert!(fallback.ends_with("run-logs/unavailable.log"));
+}
+
 #[tokio::test]
 async fn failed_process_stderr_and_prompt_never_reach_protocol_output() {
     // Break caught: child stderr or the submitted prompt being reflected into ACP output.
@@ -1022,6 +1049,10 @@ async fn failed_process_stderr_and_prompt_never_reach_protocol_output() {
     let response_json = serde_json::to_string(&response).unwrap();
     let error = response.error.as_ref().unwrap();
     let message = error["message"].as_str().unwrap();
+    let expected_reference = format!(
+        "run-logs/{}",
+        run_log_path.file_name().unwrap().to_str().unwrap()
+    );
     let mut protocol_output = String::new();
     while let Ok(line) = harness.receiver.try_recv() {
         protocol_output.push_str(&line);
@@ -1030,8 +1061,9 @@ async fn failed_process_stderr_and_prompt_never_reach_protocol_output() {
     assert_eq!(error["code"], -32000);
     assert!(message.contains("status"));
     assert!(message.contains("run log retained at"));
-    assert!(message.contains(&run_log_path.to_string_lossy().to_string()));
-    assert!(message.len() <= 512);
+    assert!(message.ends_with(&expected_reference));
+    assert!(message.len() <= crate::runtime::MAX_RUNTIME_ERROR_MESSAGE_LEN);
+    assert!(!message.contains(&harness.root.to_string_lossy().to_string()));
     assert!(run_log_path.exists());
     for forbidden in ["AGY_STDERR_SECRET_SENTINEL", prompt] {
         assert!(!response_json.contains(forbidden));

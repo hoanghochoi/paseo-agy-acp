@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -21,6 +21,28 @@ use crate::output::{self, OutputSender};
 use crate::protocol::{parse_jsonrpc_line, IncomingMessage, RpcCall};
 use crate::streaming::poll_streaming_delta;
 use crate::types::{JsonRpcNotification, JsonRpcResponse, PromptExecution, StreamingState};
+
+pub(crate) const MAX_RUNTIME_ERROR_MESSAGE_LEN: usize = 256;
+
+fn run_log_reference(run_log_path: &Path) -> String {
+    run_log_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".log"))
+        .and_then(|stem| Uuid::parse_str(stem).ok())
+        .map(|id| format!("run-logs/{id}.log"))
+        .unwrap_or_else(|| "run-logs/unavailable.log".to_string())
+}
+
+pub(crate) fn retained_run_log_message(summary: &str, run_log_path: &Path) -> String {
+    let reference = run_log_reference(run_log_path);
+    let message = format!("{summary}; run log retained at {reference}");
+    if message.len() <= MAX_RUNTIME_ERROR_MESSAGE_LEN {
+        message
+    } else {
+        format!("agy runtime failure; run log retained at {reference}")
+    }
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct ActivePrompts {
@@ -362,30 +384,25 @@ pub(crate) async fn execute_prompt(
     let response = match result {
         Ok(status) => {
             if !was_cancelled && run_timed_out {
-                JsonRpcResponse::error(
-                    id,
-                    -32000,
-                    &format!(
-                        "agy print mode timed out before a trustworthy handback; run log retained at {}",
-                        run_log_path.display()
-                    ),
-                )
-            } else if !was_cancelled && !status.success() {
-                let message = format!(
-                    "agy exited with status {status}; run log retained at {}",
-                    run_log_path.display()
+                let message = retained_run_log_message(
+                    "agy print mode timed out before a trustworthy handback",
+                    &run_log_path,
                 );
+                JsonRpcResponse::error(id, -32000, &message)
+            } else if !was_cancelled && !status.success() {
+                let status_summary = status
+                    .code()
+                    .map(|code| format!("agy exited with status code {code}"))
+                    .unwrap_or_else(|| "agy exited without a status code".to_string());
+                let message = retained_run_log_message(&status_summary, &run_log_path);
                 eprintln!("[agy-acp] WARN: {message}");
                 JsonRpcResponse::error(id, -32000, &message)
             } else if !was_cancelled && bound_conv_id.is_none() {
-                JsonRpcResponse::error(
-                    id,
-                    -32000,
-                    &format!(
-                        "agy completed but no conversation ID was found; run log retained at {}",
-                        run_log_path.display()
-                    ),
-                )
+                let message = retained_run_log_message(
+                    "agy completed but no conversation ID was found",
+                    &run_log_path,
+                );
+                JsonRpcResponse::error(id, -32000, &message)
             } else if !was_cancelled && !had_agent_text {
                 JsonRpcResponse::error(id, -32000, "agy completed without an assistant response")
             } else {
