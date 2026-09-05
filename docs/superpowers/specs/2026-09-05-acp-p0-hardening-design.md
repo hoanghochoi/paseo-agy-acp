@@ -1,6 +1,6 @@
 # ACP P0 Hardening Design
 
-**Status:** Awaiting written-spec review
+**Status:** Approved by Đại Ca on 2026-09-05
 
 **Date:** 2026-09-05
 
