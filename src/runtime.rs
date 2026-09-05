@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::adapter::Adapter;
@@ -35,6 +35,10 @@ pub(crate) struct PromptCompletion {
     session_id: String,
     registration: ActivePrompt,
     done: mpsc::UnboundedSender<()>,
+}
+
+pub(crate) struct PollerCompletion {
+    completed: oneshot::Receiver<()>,
 }
 
 impl ActivePrompts {
@@ -113,6 +117,26 @@ impl Drop for PromptCompletion {
     fn drop(&mut self) {
         self.active.complete(&self.session_id, &self.registration);
         let _ = self.done.send(());
+    }
+}
+
+impl PollerCompletion {
+    pub(crate) async fn wait(self) {
+        let _ = self.completed.await;
+    }
+}
+
+pub(crate) fn spawn_poller_thread<F>(poller: F) -> PollerCompletion
+where
+    F: FnOnce() + Send + 'static,
+{
+    let (completed, receiver) = oneshot::channel();
+    std::thread::spawn(move || {
+        poller();
+        let _ = completed.send(());
+    });
+    PollerCompletion {
+        completed: receiver,
     }
 }
 
@@ -232,7 +256,7 @@ pub(crate) async fn execute_prompt(
     let poll_stop = Arc::clone(&stop_polling);
     let poll_output = output.clone();
 
-    let poller = std::thread::spawn(move || {
+    let poller = spawn_poller_thread(move || {
         while !poll_stop.load(Ordering::SeqCst) {
             for line in poll_streaming_delta(
                 &poll_conversations_dir,
@@ -265,7 +289,7 @@ pub(crate) async fn execute_prompt(
     let stdout_text = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
     let stderr_bytes = stderr_reader.await.unwrap_or_default();
     stop_polling.store(true, Ordering::SeqCst);
-    let _ = poller.join();
+    poller.wait().await;
 
     let mut final_lines = Vec::new();
     for attempt in 0..3 {

@@ -188,6 +188,65 @@ async fn writer_failure_cancels_active_prompt_and_waits_for_completion() {
 }
 
 #[test]
+fn poller_completion_wait_keeps_single_worker_runtime_schedulable() {
+    // Break caught: synchronously joining a backpressured poller on the only Tokio worker.
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let runner = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let completed = runtime.block_on(async {
+            let (output, mut receiver) = tokio::sync::mpsc::channel(1);
+            let (saturated_tx, saturated_rx) = tokio::sync::oneshot::channel();
+            let poller = crate::runtime::spawn_poller_thread(move || {
+                output.blocking_send("first").unwrap();
+                let _ = saturated_tx.send(());
+                output.blocking_send("second").unwrap();
+            });
+
+            saturated_rx.await.unwrap();
+            let waiter = tokio::spawn(poller.wait());
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let first = receiver.recv().await;
+            let second = receiver.recv().await;
+            tokio::time::timeout(Duration::from_millis(500), waiter)
+                .await
+                .expect("poller completion was not delivered")
+                .unwrap();
+
+            let (closed_output, closed_receiver) = tokio::sync::mpsc::channel(1);
+            let (filled_tx, filled_rx) = tokio::sync::oneshot::channel();
+            let (unblocked_tx, unblocked_rx) = tokio::sync::oneshot::channel();
+            let closed_poller = crate::runtime::spawn_poller_thread(move || {
+                closed_output.blocking_send("first").unwrap();
+                let _ = filled_tx.send(());
+                let unblocked = closed_output.blocking_send("second").is_err();
+                let _ = unblocked_tx.send(unblocked);
+            });
+            filled_rx.await.unwrap();
+            drop(closed_receiver);
+            let unblocked = tokio::time::timeout(Duration::from_millis(500), unblocked_rx)
+                .await
+                .expect("closed receiver did not unblock poller")
+                .unwrap();
+            tokio::time::timeout(Duration::from_millis(500), closed_poller.wait())
+                .await
+                .expect("closed-channel poller completion was not delivered");
+
+            first == Some("first") && second == Some("second") && unblocked
+        });
+        let _ = result_tx.send(completed);
+    });
+
+    let completed = result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("single-worker runtime was blocked while awaiting poller completion");
+    runner.join().unwrap();
+    assert!(completed);
+}
+
+#[test]
 fn apply_prompt_outcome_keeps_partial_failed_turn_progress() {
     // Break caught: returning an execution error before committing a discovered binding/cursor.
     let root = fresh_test_root("partial-outcome");
