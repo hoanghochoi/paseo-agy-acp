@@ -854,6 +854,10 @@ impl ConcurrentHarness {
 // PowerShell fake-child startup has been observed at 2.1–2.8s under parallel Windows load.
 // Keep this bounded while allowing headroom above that measured range.
 const FAKE_RUN_LOG_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+// The fake child is a PowerShell process. Under a four-process live-E2E load it has
+// the same 2.1–2.8s startup cost as run-log creation, so keep a finite bound with
+// headroom rather than treating scheduler contention as a concurrency failure.
+const FAKE_CONCURRENT_PROMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn wait_for_fake_run_log(root: &std::path::Path) {
     let run_logs = root.join("state").join("run-logs");
@@ -913,7 +917,7 @@ async fn prompt_executions_for_two_sessions_run_concurrently() {
     wait_for_fake_run_log(&harness.root).await;
 
     let fast_outcome = tokio::time::timeout(
-        Duration::from_secs(2),
+        FAKE_CONCURRENT_PROMPT_TIMEOUT,
         crate::runtime::execute_prompt(
             fast,
             Arc::new(AtomicBool::new(false)),
@@ -2958,14 +2962,83 @@ fn prepare_auth() -> bool {
         eprintln!("[e2e] Using GEMINI_API_KEY");
         return true;
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let settings = format!("{}/.gemini/antigravity-cli/settings.json", home);
-    if std::path::Path::new(&settings).exists() {
+    if find_local_auth_root(configured_auth_roots()).is_some() {
         eprintln!("[e2e] Using local auth (keyring)");
         return true;
     }
     eprintln!("SKIP: No GEMINI_API_KEY and no local auth found");
     false
+}
+
+fn configured_auth_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for variable in ["HOME", "USERPROFILE"] {
+        let Ok(value) = std::env::var(variable) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        let root = PathBuf::from(value);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+fn find_local_auth_root(roots: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    roots.into_iter().find(|root| {
+        root.join(".gemini")
+            .join("antigravity-cli")
+            .join("settings.json")
+            .is_file()
+    })
+}
+
+fn release_binary_path(release_dir: &std::path::Path) -> PathBuf {
+    release_dir.join(if cfg!(windows) {
+        "agy-acp.exe"
+    } else {
+        "agy-acp"
+    })
+}
+
+#[test]
+fn release_binary_path_uses_host_executable_suffix() {
+    // Break caught: invoking the Unix release artifact name on Windows, where cargo emits agy-acp.exe.
+    let release_dir = PathBuf::from("target").join("release");
+    let expected = release_dir.join(if cfg!(windows) {
+        "agy-acp.exe"
+    } else {
+        "agy-acp"
+    });
+
+    assert_eq!(release_binary_path(&release_dir), expected);
+}
+
+#[test]
+fn local_auth_discovery_checks_a_later_environment_root() {
+    // Break caught: checking HOME only and missing Windows local auth stored under USERPROFILE.
+    let root = fresh_test_root("auth-roots");
+    let home_root = root.join("home");
+    let user_profile = root.join("user-profile");
+    fs::create_dir_all(user_profile.join(".gemini").join("antigravity-cli")).unwrap();
+    fs::write(
+        user_profile
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("settings.json"),
+        "{}",
+    )
+    .unwrap();
+
+    assert_eq!(
+        find_local_auth_root(vec![home_root, user_profile.clone()]),
+        Some(user_profile)
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2985,9 +3058,7 @@ fn test_e2e_agy_acp_full_round_trip() {
         return;
     }
 
-    let binary = std::env::current_dir()
-        .unwrap()
-        .join("target/release/agy-acp");
+    let binary = release_binary_path(&std::env::current_dir().unwrap().join("target/release"));
     if !binary.exists() {
         panic!("Run `cargo build --release` first");
     }
@@ -3095,9 +3166,7 @@ fn spawn_agy_acp() -> Option<(
         eprintln!("SKIP: agy not found in PATH");
         return None;
     }
-    let binary = std::env::current_dir()
-        .unwrap()
-        .join("target/release/agy-acp");
+    let binary = release_binary_path(&std::env::current_dir().unwrap().join("target/release"));
     if !binary.exists() {
         panic!("Run `cargo build --release` first");
     }
