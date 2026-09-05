@@ -1,5 +1,6 @@
 mod adapter;
 mod db;
+mod protocol;
 mod protobuf;
 mod streaming;
 mod types;

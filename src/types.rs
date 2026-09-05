@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Deserialize)]
@@ -17,6 +17,26 @@ pub struct JsonRpcResponse {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Value>,
+}
+
+impl JsonRpcResponse {
+    pub fn success(id: Value, result: Value) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    pub fn error(id: Value, code: i64, message: &str) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(json!({"code": code, "message": message})),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

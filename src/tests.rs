@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::adapter::{filter_narration, Adapter};
+use crate::protocol::{parse_jsonrpc_line, IncomingMessage};
+use crate::types::JsonRpcResponse;
 use crate::protobuf::{
     extract_text_from_step_payload, extract_thought_from_step_payload,
     extract_title_from_step_payload, extract_tool_name, extract_tool_update_from_step_payload,
@@ -13,6 +15,55 @@ use crate::protobuf::{
 };
 use crate::Cli;
 use clap::Parser;
+
+#[test]
+fn malformed_json_returns_parse_error() {
+    let error = parse_jsonrpc_line("{").unwrap_err();
+    assert_eq!(error.id, Value::Null);
+    assert_eq!(error.error.unwrap()["code"], -32700);
+}
+
+#[test]
+fn invalid_jsonrpc_envelope_returns_invalid_request() {
+    let error = parse_jsonrpc_line(r#"{"jsonrpc":"1.0","id":7,"method":"initialize"}"#)
+        .unwrap_err();
+    assert_eq!(error.id, json!(7));
+    assert_eq!(error.error.unwrap()["code"], -32600);
+}
+
+#[test]
+fn parser_distinguishes_request_from_notification() {
+    let request = parse_jsonrpc_line(
+        r#"{"jsonrpc":"2.0","id":null,"method":"initialize","params":{}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        request,
+        IncomingMessage::Request {
+            id: Value::Null,
+            ..
+        }
+    ));
+
+    let notification = parse_jsonrpc_line(
+        r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s"}}"#,
+    )
+    .unwrap();
+    assert!(matches!(notification, IncomingMessage::Notification { .. }));
+}
+
+#[test]
+fn response_helpers_keep_jsonrpc_shape() {
+    let response = JsonRpcResponse::error(json!(3), -32602, "Invalid params");
+    assert_eq!(
+        serde_json::to_value(response).unwrap(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "error": {"code": -32602, "message": "Invalid params"}
+        })
+    );
+}
 
 fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     loop {
