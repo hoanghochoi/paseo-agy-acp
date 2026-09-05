@@ -47,6 +47,7 @@ pub struct Adapter {
     pub state_file: PathBuf,
     pub available_models: Vec<String>,
     pub skip_naration: bool,
+    pub(crate) command: CommandSpec,
 }
 
 impl Adapter {
@@ -67,6 +68,7 @@ impl Adapter {
             state_file: state_dir.join("sessions.json"),
             available_models: Self::fetch_available_models(),
             skip_naration,
+            command: CommandSpec::new("agy", Vec::new()),
         }
     }
 
@@ -733,6 +735,7 @@ impl Adapter {
             conversations_dir: self.conversations_dir.clone(),
             state_dir,
             skip_naration: self.skip_naration,
+            command: self.command.clone(),
         })
     }
 

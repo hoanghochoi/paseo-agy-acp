@@ -92,6 +92,21 @@ ACP lifecycle requests must include an existing absolute `cwd` and an empty `mcp
 
 Non-empty `mcpServers` lists are rejected because `agy-acp` does not currently forward external MCP server definitions to `agy`.
 
+## Runtime Guarantees
+
+- ACP `session/new`, `session/load`, and `session/resume` lifecycle requests require both an existing absolute `cwd` and an `mcpServers` array. Only an empty `mcpServers` array is currently supported; missing, malformed, or non-empty values fail explicitly.
+- Prompt executions can run concurrently across different sessions. Within one session, execution is serialized so two subprocesses cannot mutate the same conversation at once.
+- All JSON-RPC responses and `session/update` notifications flow through one stdout writer, preserving complete newline-delimited JSON messages under concurrent activity.
+- Prompt content must be a non-empty array of text blocks with string `text` values. Unsupported, mixed, or malformed content fails explicitly instead of being silently dropped.
+
+## Local Verification
+
+Run the default unit suite with `cargo test`. To include filesystem-backed ignored tests without contacting Gemini or running authenticated end-to-end coverage, use:
+
+```bash
+cargo test -- --include-ignored --skip test_e2e_
+```
+
 ## Debugging
 
 To inspect the JSON-RPC messages between Zed and `agy-acp`, run `dev: open acp logs` from Zed's Command Palette.

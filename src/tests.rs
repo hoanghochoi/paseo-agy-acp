@@ -31,12 +31,14 @@ use crate::protobuf::{
     extract_user_text_from_step_payload, is_tool_step_type, read_varint,
 };
 use crate::protocol::{parse_jsonrpc_line, IncomingMessage};
-use crate::types::JsonRpcResponse;
+use crate::types::{CommandSpec, JsonRpcResponse};
 use crate::Cli;
 use clap::Parser;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::AsyncWrite;
 
 #[test]
@@ -234,6 +236,223 @@ fn fresh_test_root(label: &str) -> PathBuf {
     root
 }
 
+#[cfg(windows)]
+const WINDOWS_FAKE_AGY_SCRIPT: &str = r#"
+$logFile = $null
+$prompt = $null
+for ($i = 0; $i -lt $args.Count; $i++) {
+    if (($null -eq $logFile) -and ($args[$i] -eq '--log-file') -and (($i + 1) -lt $args.Count)) {
+        $logFile = $args[$i + 1]
+    }
+    if (($args[$i] -eq '-p') -and (($i + 1) -lt $args.Count)) {
+        $prompt = $args[$i + 1]
+    }
+}
+Set-Content -LiteralPath $logFile -Value 'Created conversation 00000000-0000-4000-8000-000000000099' -Encoding utf8
+if ($prompt -eq 'slow') { Start-Sleep -Milliseconds 3000 }
+[Console]::Out.WriteLine('fake assistant response')
+"#;
+
+#[cfg(not(windows))]
+const UNIX_FAKE_AGY_SCRIPT: &str = r#"#!/bin/sh
+log_file=''
+prompt=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --log-file)
+      if [ -z "$log_file" ] && [ "$#" -gt 1 ]; then log_file="$2"; fi
+      shift
+      ;;
+    -p)
+      if [ "$#" -gt 1 ]; then prompt="$2"; fi
+      shift
+      ;;
+  esac
+  shift
+done
+printf '%s\n' 'Created conversation 00000000-0000-4000-8000-000000000099' > "$log_file"
+if [ "$prompt" = 'slow' ]; then
+  printf '%s\n' 'fake assistant response'
+  exec sleep 3
+fi
+printf '%s\n' 'fake assistant response'
+"#;
+
+#[cfg(windows)]
+fn fake_agy_command(root: &std::path::Path) -> CommandSpec {
+    let script = root.join("fake-agy.ps1");
+    fs::write(&script, WINDOWS_FAKE_AGY_SCRIPT).unwrap();
+    CommandSpec::new(
+        "powershell.exe",
+        vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-File".into(),
+            script.into_os_string(),
+        ],
+    )
+}
+
+#[cfg(not(windows))]
+fn fake_agy_command(root: &std::path::Path) -> CommandSpec {
+    let script = root.join("fake-agy.sh");
+    fs::write(&script, UNIX_FAKE_AGY_SCRIPT).unwrap();
+    CommandSpec::new("/bin/sh", vec![script.into_os_string()])
+}
+
+struct ConcurrentHarness {
+    root: PathBuf,
+    adapter: Adapter,
+    output: crate::output::OutputSender,
+    receiver: tokio::sync::mpsc::Receiver<String>,
+}
+
+impl ConcurrentHarness {
+    fn new(label: &str) -> Self {
+        let root = fresh_test_root(label);
+        let mut adapter = test_adapter(&root);
+        adapter.command = fake_agy_command(&root);
+        for session_id in ["session-a", "session-b"] {
+            let cwd = root.join(session_id);
+            fs::create_dir_all(&cwd).unwrap();
+            adapter.sessions.insert(
+                session_id.to_string(),
+                crate::types::Session {
+                    conversation_id: None,
+                    last_step_idx: -1,
+                    model_id: None,
+                    cwd,
+                },
+            );
+        }
+        let (output, receiver) = crate::output::channel();
+        Self {
+            root,
+            adapter,
+            output,
+            receiver,
+        }
+    }
+
+    fn prepare(&mut self, session_id: &str, text: &str) -> crate::types::PromptExecution {
+        self.adapter
+            .prepare_prompt(
+                json!(Uuid::new_v4().to_string()),
+                &json!({"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}),
+            )
+            .unwrap()
+    }
+}
+
+async fn wait_for_fake_run_log(root: &std::path::Path) {
+    let run_logs = root.join("state").join("run-logs");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let started = fs::read_dir(&run_logs)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    fs::read_to_string(entry.path())
+                        .is_ok_and(|contents| contents.contains("Created conversation "))
+                });
+            if started {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fake agy did not create its invocation log");
+}
+
+#[tokio::test]
+async fn prompt_executions_for_two_sessions_run_concurrently() {
+    // Break caught: prompt execution hard-coding `agy`, preventing deterministic concurrency proof.
+    let mut harness = ConcurrentHarness::new("parallel");
+    let slow = harness.prepare("session-a", "slow");
+    let fast = harness.prepare("session-b", "fast");
+    let slow_task = tokio::spawn(crate::runtime::execute_prompt(
+        slow,
+        Arc::new(AtomicBool::new(false)),
+        harness.output.clone(),
+    ));
+    wait_for_fake_run_log(&harness.root).await;
+
+    let fast_outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        crate::runtime::execute_prompt(
+            fast,
+            Arc::new(AtomicBool::new(false)),
+            harness.output.clone(),
+        ),
+    )
+    .await
+    .expect("fast prompt did not complete while slow prompt was running");
+
+    assert!(fast_outcome.response.error.is_none());
+    assert!(!slow_task.is_finished());
+    let slow_outcome = tokio::time::timeout(Duration::from_secs(6), slow_task)
+        .await
+        .expect("slow prompt timed out")
+        .unwrap();
+    assert!(slow_outcome.response.error.is_none());
+}
+
+#[tokio::test]
+async fn cancellation_finishes_a_slow_fake_child_without_waiting_for_timeout() {
+    // Break caught: cancellation leaving the fake child or its inherited pipes alive.
+    let mut harness = ConcurrentHarness::new("cancel");
+    let execution = harness.prepare("session-a", "slow");
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn(crate::runtime::execute_prompt(
+        execution,
+        cancelled.clone(),
+        harness.output.clone(),
+    ));
+    wait_for_fake_run_log(&harness.root).await;
+
+    cancelled.store(true, Ordering::SeqCst);
+    let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("cancelled fake child did not finish promptly")
+        .unwrap();
+
+    assert_eq!(outcome.response.result.unwrap()["stopReason"], "cancelled");
+}
+
+#[tokio::test]
+async fn concurrent_output_is_valid_newline_delimited_json() {
+    // Break caught: concurrent prompt output interleaving partial JSON messages.
+    let mut harness = ConcurrentHarness::new("jsonl");
+    let first = harness.prepare("session-a", "fast");
+    let second = harness.prepare("session-b", "fast");
+    let one = crate::runtime::execute_prompt(
+        first,
+        Arc::new(AtomicBool::new(false)),
+        harness.output.clone(),
+    );
+    let two = crate::runtime::execute_prompt(
+        second,
+        Arc::new(AtomicBool::new(false)),
+        harness.output.clone(),
+    );
+
+    let (first_outcome, second_outcome) = tokio::join!(one, two);
+    assert!(first_outcome.response.error.is_none());
+    assert!(second_outcome.response.error.is_none());
+    drop(harness.output);
+
+    let mut line_count = 0;
+    while let Some(line) = harness.receiver.recv().await {
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        line_count += 1;
+    }
+    assert!(line_count >= 2);
+}
+
 fn test_adapter(root: &std::path::Path) -> Adapter {
     Adapter {
         sessions: HashMap::new(),
@@ -241,6 +460,7 @@ fn test_adapter(root: &std::path::Path) -> Adapter {
         state_file: root.join("state").join("sessions.json"),
         available_models: vec!["fake-model\tFake Model".to_string()],
         skip_naration: false,
+        command: CommandSpec::new("agy", Vec::new()),
     }
 }
 
@@ -327,6 +547,25 @@ fn prepare_prompt_rejects_unsupported_or_mixed_content() {
 }
 
 #[test]
+fn prepare_prompt_rejects_non_string_text_content() {
+    // Coverage: a text-shaped block must not stringify or silently drop structured data.
+    let root = fresh_test_root("non-string-prompt");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    let session_id = open_test_session(&mut adapter, &cwd);
+
+    let error = adapter
+        .prepare_prompt(
+            json!(6),
+            &json!({"sessionId": session_id, "prompt": [{"type": "text", "text": 42}]}),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.error.as_ref().unwrap()["code"], -32602);
+}
+
+#[test]
 fn prepare_prompt_snapshots_session_cwd_model_and_conversation() {
     // Break caught: prompt execution rereading mutable session fields after preparation.
     let root = fresh_test_root("snapshot");
@@ -366,6 +605,58 @@ fn session_new_rejects_missing_or_relative_cwd() {
         let response = adapter.handle_session_new(json!(1), &params);
         assert_eq!(response.error.as_ref().unwrap()["code"], -32602);
     }
+}
+
+#[test]
+fn session_new_rejects_empty_cwd() {
+    // Coverage: an empty cwd must not fall back to the bridge process directory.
+    let root = fresh_test_root("empty-cwd");
+    let mut adapter = test_adapter(&root);
+    let response = adapter.handle_session_new(json!(1), &json!({"cwd": "", "mcpServers": []}));
+
+    assert_eq!(response.error.as_ref().unwrap()["code"], -32602);
+}
+
+#[test]
+fn session_new_rejects_absolute_existing_non_directory_cwd() {
+    // Coverage: absolute path validation must distinguish files from directories.
+    let root = fresh_test_root("file-cwd");
+    let file = root.join("workspace-file");
+    fs::write(&file, "not a directory").unwrap();
+    let mut adapter = test_adapter(&root);
+    let response = adapter.handle_session_new(
+        json!(1),
+        &json!({"cwd": file.to_string_lossy(), "mcpServers": []}),
+    );
+
+    assert_eq!(response.error.as_ref().unwrap()["code"], -32602);
+}
+
+#[test]
+fn session_new_rejects_missing_mcp_servers() {
+    // Coverage: omitting mcpServers must not be treated as an empty list.
+    let root = fresh_test_root("missing-mcp");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    let response = adapter.handle_session_new(json!(1), &json!({"cwd": cwd.to_string_lossy()}));
+
+    assert_eq!(response.error.as_ref().unwrap()["code"], -32602);
+}
+
+#[test]
+fn session_new_rejects_non_array_mcp_servers() {
+    // Coverage: object-shaped MCP configuration must fail instead of being ignored.
+    let root = fresh_test_root("non-array-mcp");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    let response = adapter.handle_session_new(
+        json!(1),
+        &json!({"cwd": cwd.to_string_lossy(), "mcpServers": {}}),
+    );
+
+    assert_eq!(response.error.as_ref().unwrap()["code"], -32602);
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::sync::{
@@ -139,33 +140,37 @@ pub(crate) async fn execute_prompt(
         conversations_dir,
         state_dir,
         skip_naration,
+        command,
     } = execution;
     let run_logs_dir = state_dir.join("run-logs");
     let run_log_path = run_logs_dir.join(format!("{}.log", Uuid::new_v4()));
 
-    let mut args = vec![
-        "--add-dir".to_string(),
-        cwd.to_string_lossy().to_string(),
-        "--log-file".to_string(),
-        run_log_path.to_string_lossy().to_string(),
-        "--print-timeout".to_string(),
-        std::env::var("AGY_PRINT_TIMEOUT").unwrap_or_else(|_| "24h".to_string()),
+    let mut args: Vec<OsString> = vec![
+        "--add-dir".into(),
+        cwd.as_os_str().to_os_string(),
+        "--log-file".into(),
+        run_log_path.as_os_str().to_os_string(),
+        "--print-timeout".into(),
+        std::env::var("AGY_PRINT_TIMEOUT")
+            .unwrap_or_else(|_| "24h".to_string())
+            .into(),
     ];
     if let Ok(extra) = std::env::var("AGY_EXTRA_ARGS") {
-        args.extend(extra.split_whitespace().map(String::from));
+        args.extend(extra.split_whitespace().map(OsString::from));
     }
     if let Some(conv_id) = &conversation_id {
-        args.push("--conversation".to_string());
-        args.push(conv_id.clone());
+        args.push("--conversation".into());
+        args.push(conv_id.into());
     }
     if let Some(model_id) = &model_id {
-        args.push("--model".to_string());
-        args.push(model_id.clone());
+        args.push("--model".into());
+        args.push(model_id.into());
     }
-    args.push("-p".to_string());
-    args.push(prompt_text);
+    args.push("-p".into());
+    args.push(prompt_text.into());
 
-    let spawn_result = Command::new("agy")
+    let spawn_result = Command::new(&command.program)
+        .args(&command.prefix_args)
         .args(&args)
         .current_dir(&cwd)
         .stdin(std::process::Stdio::null())

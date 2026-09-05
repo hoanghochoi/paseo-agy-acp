@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +78,21 @@ pub struct Session {
     pub cwd: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CommandSpec {
+    pub(crate) program: OsString,
+    pub(crate) prefix_args: Vec<OsString>,
+}
+
+impl CommandSpec {
+    pub(crate) fn new(program: impl Into<OsString>, prefix_args: Vec<OsString>) -> Self {
+        Self {
+            program: program.into(),
+            prefix_args,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PromptExecution {
     pub id: Value,
@@ -89,6 +105,7 @@ pub(crate) struct PromptExecution {
     pub conversations_dir: PathBuf,
     pub state_dir: PathBuf,
     pub skip_naration: bool,
+    pub command: CommandSpec,
 }
 
 #[cfg(test)]
