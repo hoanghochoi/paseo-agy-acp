@@ -386,19 +386,20 @@ fn late_outcome_updates_evicted_persisted_session_without_reinserting_it() {
         .expect("evicted victim should remain persisted");
     assert_eq!(before.cwd.as_deref(), Some(root.to_string_lossy().as_ref()));
     assert_eq!(before.model_id.as_deref(), Some("preserved-model"));
+    let run_log_path = root.join("evicted-outcome.log");
+    fs::write(&run_log_path, b"late outcome diagnostic").unwrap();
 
     let outcome = crate::runtime::PromptOutcome {
         session_id: victim.clone(),
         conversation_id: Some("late-conversation".to_string()),
         last_step_idx: 42,
         response: JsonRpcResponse::success(json!(12), json!({"stopReason": "end_turn"})),
-        run_log_path: root.join("evicted-outcome.log"),
-        remove_run_log_on_commit: false,
+        run_log_path: run_log_path.clone(),
+        remove_run_log_on_commit: true,
     };
-    adapter
-        .apply_prompt_outcome(&outcome)
-        .expect("persisted evicted session should accept its late outcome");
+    let response = crate::runtime::finalize_prompt_outcome(&mut adapter, outcome);
 
+    assert!(response.error.is_none());
     let after = adapter
         .restore_session(victim)
         .expect("updated victim state should be readable")
@@ -408,6 +409,295 @@ fn late_outcome_updates_evicted_persisted_session_without_reinserting_it() {
     assert_eq!(after.cwd, before.cwd);
     assert_eq!(after.model_id, before.model_id);
     assert!(!adapter.sessions.contains_key(victim));
+    assert!(!run_log_path.exists());
+}
+
+#[test]
+fn resident_conversation_conflict_fails_without_mutation_and_retains_run_log() {
+    // Break caught: combining resident conversation A with outcome B's cursor.
+    let root = fresh_test_root("resident-conversation-conflict");
+    let mut adapter = test_adapter(&root);
+    let session_id = "resident-conflict";
+    let session = crate::types::Session {
+        conversation_id: Some("conversation-a".to_string()),
+        last_step_idx: 11,
+        model_id: Some("preserved-model".to_string()),
+        cwd: root.clone(),
+    };
+    adapter
+        .persist_session(session_id, &session)
+        .expect("resident conflict fixture should persist");
+    adapter
+        .sessions
+        .insert(session_id.to_string(), session.clone());
+    let stored_before = adapter
+        .restore_session(session_id)
+        .expect("resident conflict store should be readable")
+        .expect("resident conflict row should exist");
+    let run_log_path = root.join("resident-conflict.log");
+    fs::write(&run_log_path, b"resident conflict diagnostic").unwrap();
+    let outcome = crate::runtime::PromptOutcome {
+        session_id: session_id.to_string(),
+        conversation_id: Some("conversation-b".to_string()),
+        last_step_idx: 99,
+        response: JsonRpcResponse::success(json!(13), json!({"stopReason": "end_turn"})),
+        run_log_path: run_log_path.clone(),
+        remove_run_log_on_commit: true,
+    };
+
+    let response = crate::runtime::finalize_prompt_outcome(&mut adapter, outcome);
+
+    assert_persistence_error(&response);
+    assert_eq!(adapter.sessions[session_id], session);
+    assert_eq!(
+        adapter
+            .restore_session(session_id)
+            .expect("resident conflict store should remain readable")
+            .expect("resident conflict row should remain present"),
+        stored_before
+    );
+    assert!(run_log_path.exists());
+}
+
+#[test]
+fn evicted_conversation_conflict_fails_without_mutation_and_retains_run_log() {
+    // Break caught: replacing persisted conversation A with evicted outcome B.
+    let root = fresh_test_root("evicted-conversation-conflict");
+    let mut adapter = test_adapter(&root);
+    let session_id = "evicted-conflict";
+    let session = crate::types::Session {
+        conversation_id: Some("conversation-a".to_string()),
+        last_step_idx: 21,
+        model_id: Some("preserved-model".to_string()),
+        cwd: root.clone(),
+    };
+    adapter
+        .persist_session(session_id, &session)
+        .expect("evicted conflict fixture should persist");
+    let stored_before = adapter
+        .restore_session(session_id)
+        .expect("evicted conflict store should be readable")
+        .expect("evicted conflict row should exist");
+    let run_log_path = root.join("evicted-conflict.log");
+    fs::write(&run_log_path, b"evicted conflict diagnostic").unwrap();
+    let outcome = crate::runtime::PromptOutcome {
+        session_id: session_id.to_string(),
+        conversation_id: Some("conversation-b".to_string()),
+        last_step_idx: 100,
+        response: JsonRpcResponse::success(json!(14), json!({"stopReason": "end_turn"})),
+        run_log_path: run_log_path.clone(),
+        remove_run_log_on_commit: true,
+    };
+
+    let response = crate::runtime::finalize_prompt_outcome(&mut adapter, outcome);
+
+    assert_persistence_error(&response);
+    assert!(!adapter.sessions.contains_key(session_id));
+    assert_eq!(
+        adapter
+            .restore_session(session_id)
+            .expect("evicted conflict store should remain readable")
+            .expect("evicted conflict row should remain present"),
+        stored_before
+    );
+    assert!(run_log_path.exists());
+}
+
+#[test]
+fn resident_matching_outcome_rejects_conflicting_persisted_binding() {
+    // Break caught: a resident B/outcome B pair overwriting stale persisted conversation A.
+    let root = fresh_test_root("persisted-conversation-conflict");
+    let mut adapter = test_adapter(&root);
+    let session_id = "persisted-conflict";
+    let persisted = crate::types::Session {
+        conversation_id: Some("conversation-a".to_string()),
+        last_step_idx: 30,
+        model_id: Some("persisted-model".to_string()),
+        cwd: root.clone(),
+    };
+    adapter
+        .persist_session(session_id, &persisted)
+        .expect("persisted conflict fixture should persist");
+    let resident = crate::types::Session {
+        conversation_id: Some("conversation-b".to_string()),
+        last_step_idx: 31,
+        model_id: Some("resident-model".to_string()),
+        cwd: root.clone(),
+    };
+    adapter
+        .sessions
+        .insert(session_id.to_string(), resident.clone());
+    let stored_before = adapter
+        .restore_session(session_id)
+        .expect("persisted conflict store should be readable")
+        .expect("persisted conflict row should exist");
+    let run_log_path = root.join("persisted-conflict.log");
+    fs::write(&run_log_path, b"persisted conflict diagnostic").unwrap();
+    let outcome = crate::runtime::PromptOutcome {
+        session_id: session_id.to_string(),
+        conversation_id: Some("conversation-b".to_string()),
+        last_step_idx: 32,
+        response: JsonRpcResponse::success(json!(17), json!({"stopReason": "end_turn"})),
+        run_log_path: run_log_path.clone(),
+        remove_run_log_on_commit: true,
+    };
+
+    let response = crate::runtime::finalize_prompt_outcome(&mut adapter, outcome);
+
+    assert_persistence_error(&response);
+    assert_eq!(adapter.sessions[session_id], resident);
+    assert_eq!(
+        adapter
+            .restore_session(session_id)
+            .expect("persisted conflict store should remain readable")
+            .expect("persisted conflict row should remain present"),
+        stored_before
+    );
+    assert!(run_log_path.exists());
+}
+
+#[test]
+fn prompt_outcome_cursor_is_monotonic_for_resident_and_evicted_sessions() {
+    // Break caught: regressing a same-conversation cursor or failing to advance it.
+    let root = fresh_test_root("monotonic-outcomes");
+    let mut adapter = test_adapter(&root);
+    let resident_id = "resident-monotonic";
+    let resident = crate::types::Session {
+        conversation_id: Some("conversation-b".to_string()),
+        last_step_idx: 10,
+        model_id: None,
+        cwd: root.clone(),
+    };
+    adapter
+        .persist_session(resident_id, &resident)
+        .expect("resident monotonic fixture should persist");
+    adapter.sessions.insert(resident_id.to_string(), resident);
+    let resident_outcome = crate::runtime::PromptOutcome {
+        session_id: resident_id.to_string(),
+        conversation_id: Some("conversation-b".to_string()),
+        last_step_idx: 6,
+        response: JsonRpcResponse::success(json!(15), json!({"stopReason": "end_turn"})),
+        run_log_path: root.join("resident-monotonic.log"),
+        remove_run_log_on_commit: false,
+    };
+
+    let resident_response = crate::runtime::finalize_prompt_outcome(&mut adapter, resident_outcome);
+
+    assert!(resident_response.error.is_none());
+    assert_eq!(adapter.sessions[resident_id].last_step_idx, 10);
+    assert_eq!(
+        adapter
+            .restore_session(resident_id)
+            .expect("resident monotonic store should be readable")
+            .expect("resident monotonic row should exist")
+            .last_step_idx,
+        10
+    );
+
+    let evicted_id = "evicted-monotonic";
+    let evicted = crate::types::Session {
+        conversation_id: Some("conversation-b".to_string()),
+        last_step_idx: 20,
+        model_id: None,
+        cwd: root.clone(),
+    };
+    adapter
+        .persist_session(evicted_id, &evicted)
+        .expect("evicted monotonic fixture should persist");
+    let evicted_outcome = crate::runtime::PromptOutcome {
+        session_id: evicted_id.to_string(),
+        conversation_id: Some("conversation-b".to_string()),
+        last_step_idx: 25,
+        response: JsonRpcResponse::success(json!(16), json!({"stopReason": "end_turn"})),
+        run_log_path: root.join("evicted-monotonic.log"),
+        remove_run_log_on_commit: false,
+    };
+
+    let evicted_response = crate::runtime::finalize_prompt_outcome(&mut adapter, evicted_outcome);
+
+    assert!(evicted_response.error.is_none());
+    assert!(!adapter.sessions.contains_key(evicted_id));
+    assert_eq!(
+        adapter
+            .restore_session(evicted_id)
+            .expect("evicted monotonic store should be readable")
+            .expect("evicted monotonic row should exist")
+            .last_step_idx,
+        25
+    );
+}
+
+#[test]
+fn outcome_without_conversation_preserves_resident_and_evicted_bindings() {
+    // Retained contract: an unbound outcome must not alter an existing binding or cursor.
+    let root = fresh_test_root("outcome-without-conversation");
+    let mut adapter = test_adapter(&root);
+    let resident_id = "resident-without-outcome-binding";
+    let resident = crate::types::Session {
+        conversation_id: Some("conversation-a".to_string()),
+        last_step_idx: 40,
+        model_id: None,
+        cwd: root.clone(),
+    };
+    adapter
+        .persist_session(resident_id, &resident)
+        .expect("resident no-binding fixture should persist");
+    adapter
+        .sessions
+        .insert(resident_id.to_string(), resident.clone());
+    let resident_outcome = crate::runtime::PromptOutcome {
+        session_id: resident_id.to_string(),
+        conversation_id: None,
+        last_step_idx: 400,
+        response: JsonRpcResponse::error(json!(18), -32000, "process failed"),
+        run_log_path: root.join("resident-without-binding.log"),
+        remove_run_log_on_commit: false,
+    };
+
+    adapter
+        .apply_prompt_outcome(&resident_outcome)
+        .expect("resident outcome without binding should commit");
+
+    assert_eq!(adapter.sessions[resident_id], resident);
+    assert_eq!(
+        adapter
+            .restore_session(resident_id)
+            .expect("resident no-binding state should be readable")
+            .expect("resident no-binding row should exist")
+            .last_step_idx,
+        40
+    );
+
+    let evicted_id = "evicted-without-outcome-binding";
+    let evicted = crate::types::Session {
+        conversation_id: Some("conversation-a".to_string()),
+        last_step_idx: 50,
+        model_id: None,
+        cwd: root.clone(),
+    };
+    adapter
+        .persist_session(evicted_id, &evicted)
+        .expect("evicted no-binding fixture should persist");
+    let evicted_outcome = crate::runtime::PromptOutcome {
+        session_id: evicted_id.to_string(),
+        conversation_id: None,
+        last_step_idx: 500,
+        response: JsonRpcResponse::error(json!(19), -32000, "process failed"),
+        run_log_path: root.join("evicted-without-binding.log"),
+        remove_run_log_on_commit: false,
+    };
+
+    adapter
+        .apply_prompt_outcome(&evicted_outcome)
+        .expect("evicted outcome without binding should commit");
+
+    assert!(!adapter.sessions.contains_key(evicted_id));
+    let stored = adapter
+        .restore_session(evicted_id)
+        .expect("evicted no-binding state should be readable")
+        .expect("evicted no-binding row should exist");
+    assert_eq!(stored.conversation_id.as_deref(), Some("conversation-a"));
+    assert_eq!(stored.last_step_idx, 50);
 }
 
 fn fresh_test_root(label: &str) -> PathBuf {

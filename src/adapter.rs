@@ -36,6 +36,33 @@ fn stored_session_from_session(session: &Session) -> StoredSession {
     }
 }
 
+fn conversation_bindings_conflict(left: Option<&str>, right: Option<&str>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left != right)
+}
+
+fn apply_outcome_binding(
+    conversation_id: &mut Option<String>,
+    last_step_idx: &mut i64,
+    outcome: &PromptOutcome,
+) -> io::Result<()> {
+    let Some(outcome_conversation_id) = outcome.conversation_id.as_deref() else {
+        return Ok(());
+    };
+
+    match conversation_id.as_deref() {
+        Some(current) if current != outcome_conversation_id => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "prompt outcome conversation conflicts with session state",
+            ))
+        }
+        Some(_) => {}
+        None => *conversation_id = Some(outcome_conversation_id.to_string()),
+    }
+    *last_step_idx = (*last_step_idx).max(outcome.last_step_idx);
+    Ok(())
+}
+
 fn validate_session_setup(params: &Value) -> Result<PathBuf, String> {
     let cwd = params
         .get("cwd")
@@ -226,7 +253,14 @@ impl Adapter {
         serde_json::to_writer_pretty(&mut file, store)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         file.flush()?;
-        fs::rename(&tmp, &self.state_file)
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, &self.state_file)?;
+        #[cfg(unix)]
+        if let Some(parent) = self.state_file.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 
     fn update_store<F>(&self, update: F) -> io::Result<()>
@@ -725,13 +759,41 @@ impl Adapter {
     pub(crate) fn apply_prompt_outcome(&mut self, outcome: &PromptOutcome) -> io::Result<()> {
         if let Some(session) = self.sessions.get(&outcome.session_id) {
             let mut candidate = session.clone();
-            if candidate.conversation_id.is_none() {
-                candidate.conversation_id = outcome.conversation_id.clone();
-            }
-            if outcome.conversation_id.is_some() {
-                candidate.last_step_idx = outcome.last_step_idx;
-            }
-            self.persist_session(&outcome.session_id, &candidate)?;
+            apply_outcome_binding(
+                &mut candidate.conversation_id,
+                &mut candidate.last_step_idx,
+                outcome,
+            )?;
+            self.update_store(|store| {
+                let Some(stored) = store.sessions.get_mut(&outcome.session_id) else {
+                    store.sessions.insert(
+                        outcome.session_id.clone(),
+                        stored_session_from_session(&candidate),
+                    );
+                    return Ok(());
+                };
+
+                if conversation_bindings_conflict(
+                    stored.conversation_id.as_deref(),
+                    candidate.conversation_id.as_deref(),
+                ) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "persisted conversation conflicts with resident session",
+                    ));
+                }
+
+                if outcome.conversation_id.is_some() {
+                    apply_outcome_binding(
+                        &mut stored.conversation_id,
+                        &mut stored.last_step_idx,
+                        outcome,
+                    )?;
+                    candidate.last_step_idx = candidate.last_step_idx.max(stored.last_step_idx);
+                    *stored = stored_session_from_session(&candidate);
+                }
+                Ok(())
+            })?;
             self.sessions.insert(outcome.session_id.clone(), candidate);
             return Ok(());
         }
@@ -740,13 +802,11 @@ impl Adapter {
             let stored = store.sessions.get_mut(&outcome.session_id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "prompt session state is missing")
             })?;
-            if stored.conversation_id.is_none() {
-                stored.conversation_id = outcome.conversation_id.clone();
-            }
-            if outcome.conversation_id.is_some() {
-                stored.last_step_idx = outcome.last_step_idx;
-            }
-            Ok(())
+            apply_outcome_binding(
+                &mut stored.conversation_id,
+                &mut stored.last_step_idx,
+                outcome,
+            )
         })
     }
 }
