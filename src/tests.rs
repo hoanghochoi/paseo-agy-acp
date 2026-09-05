@@ -34,6 +34,160 @@ use crate::protocol::{parse_jsonrpc_line, IncomingMessage};
 use crate::types::JsonRpcResponse;
 use crate::Cli;
 use clap::Parser;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::AsyncWrite;
+
+#[test]
+fn active_prompts_allow_different_sessions_and_reject_duplicates() {
+    // Break caught: replacing an in-flight registration for the same session.
+    let active = crate::runtime::ActivePrompts::default();
+    let first = active.register("session-a").unwrap();
+    assert!(active.register("session-a").is_err());
+    assert!(active.register("session-b").is_ok());
+    active.complete("session-a", &first);
+    assert!(active.register("session-a").is_ok());
+}
+
+#[test]
+fn cancel_targets_only_the_registered_session() {
+    // Break caught: a session/cancel request cancelling unrelated prompts.
+    let active = crate::runtime::ActivePrompts::default();
+    let first = active.register("session-a").unwrap();
+    let second = active.register("session-b").unwrap();
+    assert!(active.cancel("session-a"));
+    assert!(first.is_cancelled());
+    assert!(!second.is_cancelled());
+}
+
+#[test]
+fn active_prompts_complete_uses_registration_identity() {
+    // Break caught: stale task cleanup removing a newer registration.
+    let active = crate::runtime::ActivePrompts::default();
+    let stale = active.register("session-a").unwrap();
+    active.complete("session-a", &stale);
+    let current = active.register("session-a").unwrap();
+
+    active.complete("session-a", &stale);
+
+    assert!(active.register("session-a").is_err());
+    active.complete("session-a", &current);
+}
+
+#[test]
+fn active_prompts_cancel_all_marks_snapshot() {
+    // Break caught: fatal bridge shutdown leaving one or more child prompts running.
+    let active = crate::runtime::ActivePrompts::default();
+    let first = active.register("session-a").unwrap();
+    let second = active.register("session-b").unwrap();
+
+    active.cancel_all();
+
+    assert!(first.is_cancelled());
+    assert!(second.is_cancelled());
+}
+
+#[test]
+fn active_prompts_completion_guard_cleans_registry_on_drop() {
+    // Break caught: a panic/abort path leaking the active registration and completion count.
+    let active = crate::runtime::ActivePrompts::default();
+    let registration = active.register("session-a").unwrap();
+    let (done, mut completions) = tokio::sync::mpsc::unbounded_channel();
+
+    drop(crate::runtime::PromptCompletion::new(
+        active.clone(),
+        "session-a".to_string(),
+        registration,
+        done,
+    ));
+
+    assert!(active.register("session-a").is_ok());
+    assert_eq!(completions.try_recv(), Ok(()));
+}
+
+struct BrokenPipeWriter;
+
+impl AsyncWrite for BrokenPipeWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "test writer closed",
+        )))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn bridge_returns_writer_failure() {
+    // Break caught: stdout failure being logged and swallowed with a zero exit status.
+    let root = fresh_test_root("writer-failure");
+    let adapter = test_adapter(&root);
+    let (input, receiver) = tokio::sync::mpsc::unbounded_channel();
+    input
+        .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string())
+        .unwrap();
+    drop(input);
+
+    let error = crate::runtime::run_bridge(adapter, receiver, BrokenPipeWriter)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+#[test]
+fn apply_prompt_outcome_keeps_partial_failed_turn_progress() {
+    // Break caught: returning an execution error before committing a discovered binding/cursor.
+    let root = fresh_test_root("partial-outcome");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    let session_id = open_test_session(&mut adapter, &cwd);
+    let outcome = crate::runtime::PromptOutcome {
+        session_id: session_id.clone(),
+        conversation_id: Some("conversation-after-error".to_string()),
+        last_step_idx: 9,
+        response: JsonRpcResponse::error(json!(8), -32000, "terminal check failed"),
+    };
+
+    adapter.apply_prompt_outcome(&outcome);
+
+    let session = &adapter.sessions[&session_id];
+    assert_eq!(
+        session.conversation_id.as_deref(),
+        Some("conversation-after-error")
+    );
+    assert_eq!(session.last_step_idx, 9);
+}
+
+#[test]
+fn apply_prompt_outcome_never_recreates_a_missing_session() {
+    // Break caught: a late prompt completion resurrecting a removed session.
+    let root = fresh_test_root("missing-outcome");
+    let mut adapter = test_adapter(&root);
+    let outcome = crate::runtime::PromptOutcome {
+        session_id: "removed-session".to_string(),
+        conversation_id: Some("late-conversation".to_string()),
+        last_step_idx: 3,
+        response: JsonRpcResponse::success(json!(9), json!({"stopReason": "end_turn"})),
+    };
+
+    adapter.apply_prompt_outcome(&outcome);
+
+    assert!(!adapter.sessions.contains_key("removed-session"));
+    assert!(adapter.restore_session("removed-session").is_none());
+}
 
 fn fresh_test_root(label: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("agy-acp-{label}-{}", Uuid::new_v4()));

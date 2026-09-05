@@ -1,22 +1,14 @@
 use fs2::FileExt;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
-use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 use uuid::Uuid;
 
 #[cfg(test)]
 use crate::db::read_delta_from_db;
 use crate::db::read_replay_updates_from_db;
-use crate::output::OutputSender;
-use crate::streaming::poll_streaming_delta;
+use crate::runtime::PromptOutcome;
 use crate::types::*;
 
 fn validate_session_setup(params: &Value) -> Result<PathBuf, String> {
@@ -754,310 +746,27 @@ impl Adapter {
         })
     }
 
-    pub async fn handle_session_prompt(
-        &mut self,
-        id: Value,
-        params: &Value,
-        cancelled: Arc<AtomicBool>,
-        output: OutputSender,
-    ) -> JsonRpcResponse {
-        let execution = match self.prepare_prompt(id, params) {
-            Ok(execution) => execution,
-            Err(error) => return error,
-        };
-        self.handle_prepared_prompt(execution, cancelled, output)
-            .await
-    }
-
-    pub(crate) async fn handle_prepared_prompt(
-        &mut self,
-        execution: PromptExecution,
-        cancelled: Arc<AtomicBool>,
-        output: OutputSender,
-    ) -> JsonRpcResponse {
-        let PromptExecution {
-            id,
-            session_id,
-            prompt_text,
-            cwd,
-            conversation_id,
-            model_id,
-            initial_step_idx,
-            conversations_dir,
-            state_dir,
-            skip_naration,
-        } = execution;
-        let run_logs_dir = state_dir.join("run-logs");
-        let run_log_path = run_logs_dir.join(format!("{}.log", Uuid::new_v4()));
-
-        let mut args: Vec<String> = Vec::new();
-        args.push("--add-dir".to_string());
-        args.push(cwd.to_string_lossy().to_string());
-        args.push("--log-file".to_string());
-        args.push(run_log_path.to_string_lossy().to_string());
-        args.push("--print-timeout".to_string());
-        args.push(std::env::var("AGY_PRINT_TIMEOUT").unwrap_or_else(|_| "24h".to_string()));
-        if let Ok(extra) = std::env::var("AGY_EXTRA_ARGS") {
-            args.extend(extra.split_whitespace().map(String::from));
-        }
-        if let Some(conv_id) = &conversation_id {
-            args.push("--conversation".to_string());
-            args.push(conv_id.clone());
-        }
-        if let Some(model_id) = &model_id {
-            args.push("--model".to_string());
-            args.push(model_id.clone());
-        }
-        args.push("-p".to_string());
-        args.push(prompt_text);
-
-        let spawn_result = Command::new("agy")
-            .args(&args)
-            .current_dir(&cwd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-
-        let mut child = match spawn_result {
-            Ok(child) => child,
-            Err(e) => {
-                return JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: None,
-                    error: Some(json!({"code":-32000,"message":format!("failed to run agy: {e}")})),
-                };
-            }
+    pub(crate) fn apply_prompt_outcome(&mut self, outcome: &PromptOutcome) {
+        let Some(session) = self.sessions.get_mut(&outcome.session_id) else {
+            return;
         };
 
-        let mut stdout = child.stdout.take();
-        let stdout_reader = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(mut stdout) = stdout.take() {
-                let _ = stdout.read_to_end(&mut buf).await;
-            }
-            buf
-        });
-
-        let mut stderr = child.stderr.take();
-        let stderr_reader = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(mut stderr) = stderr.take() {
-                let _ = stderr.read_to_end(&mut buf).await;
-            }
-            buf
-        });
-
-        let streaming_state = Arc::new(Mutex::new(StreamingState {
-            conversation_id,
-            base_step_idx: initial_step_idx,
-            last_step_idx: initial_step_idx,
-            had_agent_text: false,
-            agent_text_lengths: HashMap::new(),
-            thought_text_lengths: HashMap::new(),
-            emitted_tool_steps: HashSet::new(),
-            last_title: None,
-            skip_naration,
-            child_pid: child.id(),
-        }));
-        let stop_polling = Arc::new(AtomicBool::new(false));
-        let poll_conversations_dir = conversations_dir.clone();
-        let poll_run_log_path = run_log_path.clone();
-        let poll_session_id = session_id.clone();
-        let poll_state = Arc::clone(&streaming_state);
-        let poll_stop = Arc::clone(&stop_polling);
-        let poll_output = output.clone();
-
-        let poller = std::thread::spawn(move || {
-            while !poll_stop.load(Ordering::SeqCst) {
-                for line in poll_streaming_delta(
-                    &poll_conversations_dir,
-                    Some(&poll_run_log_path),
-                    &poll_session_id,
-                    &poll_state,
-                ) {
-                    if poll_output.blocking_send(line).is_err() {
-                        return;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        });
-
-        let mut was_cancelled = false;
-        let result = tokio::select! {
-            result = child.wait() => result,
-            _ = async {
-                while !cancelled.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            } => {
-                was_cancelled = true;
-                let _ = child.kill().await;
-                child.wait().await
-            }
-        };
-        let stdout_bytes = stdout_reader.await.unwrap_or_default();
-        let stdout_text = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
-        let stderr_bytes = stderr_reader.await.unwrap_or_default();
-        stop_polling.store(true, Ordering::SeqCst);
-        let _ = poller.join();
-
-        let mut final_lines = Vec::new();
-        for attempt in 0..3 {
-            let lines = poll_streaming_delta(
-                &conversations_dir,
-                Some(&run_log_path),
-                &session_id,
-                &streaming_state,
-            );
-            final_lines.extend(lines);
-            if attempt < 2 {
-                std::thread::sleep(Duration::from_millis(100));
-            }
+        if session.conversation_id.is_none() {
+            session.conversation_id = outcome.conversation_id.clone();
+        }
+        if outcome.conversation_id.is_some() {
+            session.last_step_idx = outcome.last_step_idx;
         }
 
-        let had_agent_text_before_stdout = streaming_state.lock().unwrap().had_agent_text;
-        if !was_cancelled && !had_agent_text_before_stdout && !stdout_text.is_empty() {
-            final_lines.push(
-                serde_json::to_string(&JsonRpcNotification {
-                    jsonrpc: "2.0",
-                    method: "session/update".to_string(),
-                    params: json!({
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": { "type": "text", "text": stdout_text },
-                        },
-                    }),
-                })
-                .unwrap(),
-            );
-            let mut state = streaming_state.lock().unwrap();
-            state.had_agent_text = true;
-        }
-
-        for line in final_lines {
-            if output.send(line).await.is_err() {
-                break;
-            }
-        }
-
-        let state = streaming_state.lock().unwrap();
-        let bound_conv_id = state.conversation_id.clone();
-        let new_step_idx = state.last_step_idx;
-        let had_agent_text = state.had_agent_text;
-        drop(state);
-
-        if let Some(session) = self.sessions.get_mut(&session_id) {
-            if session.conversation_id.is_none() {
-                session.conversation_id = bound_conv_id.clone();
-            }
-            if bound_conv_id.is_some() {
-                session.last_step_idx = new_step_idx;
-            }
-        }
-        if bound_conv_id.is_some() {
+        let model_id = session.model_id.clone();
+        if outcome.conversation_id.is_some() {
             self.persist_session(
-                &session_id,
-                bound_conv_id.as_deref(),
-                new_step_idx,
+                &outcome.session_id,
+                outcome.conversation_id.as_deref(),
+                outcome.last_step_idx,
                 model_id.as_deref(),
             );
         }
-        let run_timed_out = crate::db::agy_run_timed_out(&run_log_path);
-
-        let stop_reason = if was_cancelled {
-            "cancelled"
-        } else {
-            "end_turn"
-        };
-        let response = JsonRpcResponse {
-            jsonrpc: "2.0",
-            id: id.clone(),
-            result: Some(json!({ "stopReason": stop_reason })),
-            error: None,
-        };
-
-        match result {
-            Ok(status) => {
-                let stderr_text = String::from_utf8_lossy(&stderr_bytes);
-                if !stderr_text.is_empty() {
-                    eprintln!("[agy-acp] agy stderr: {}", stderr_text.trim_end());
-                }
-
-                if !was_cancelled && run_timed_out {
-                    return JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        result: None,
-                        error: Some(json!({
-                            "code": -32000,
-                            "message": format!(
-                                "agy print mode timed out before a trustworthy handback; run log retained at {}",
-                                run_log_path.display()
-                            ),
-                        })),
-                    };
-                }
-
-                if !was_cancelled && !status.success() {
-                    eprintln!("[agy-acp] WARN: agy exited with status: {}", status);
-                    let msg = if stderr_text.is_empty() {
-                        format!("agy exited with status: {}", status)
-                    } else {
-                        format!("agy failed: {}", stderr_text.trim_end())
-                    };
-                    return JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        result: None,
-                        error: Some(json!({"code":-32000,"message":msg})),
-                    };
-                }
-
-                if !was_cancelled && bound_conv_id.is_none() {
-                    return JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        result: None,
-                        error: Some(json!({
-                            "code": -32000,
-                            "message": format!(
-                                "agy completed but no conversation ID was found; run log retained at {}",
-                                run_log_path.display()
-                            ),
-                        })),
-                    };
-                }
-
-                if !was_cancelled && !had_agent_text {
-                    return JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        result: None,
-                        error: Some(json!({
-                            "code": -32000,
-                            "message": "agy completed without an assistant response",
-                        })),
-                    };
-                }
-            }
-            Err(e) => {
-                return JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: None,
-                    error: Some(
-                        json!({"code":-32000,"message":format!("failed to wait for agy: {e}")}),
-                    ),
-                };
-            }
-        }
-
-        let _ = fs::remove_file(&run_log_path);
-        response
     }
 }
 
