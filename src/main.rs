@@ -25,6 +25,19 @@ struct Cli {
     skip_naration: bool,
 }
 
+pub(crate) fn forward_input_lines<R: BufRead>(
+    reader: R,
+    input_tx: mpsc::UnboundedSender<String>,
+) -> io::Result<()> {
+    for line in reader.lines() {
+        let line = line?;
+        if input_tx.send(line).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -37,19 +50,8 @@ async fn main() {
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
         let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(line) if !line.trim().is_empty() => {
-                    if input_tx.send(line).is_err() {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    eprintln!("[agy-acp] stdin failed: {error}");
-                    break;
-                }
-            }
+        if let Err(error) = forward_input_lines(stdin.lock(), input_tx) {
+            eprintln!("[agy-acp] stdin failed: {error}");
         }
     });
 

@@ -150,6 +150,33 @@ async fn bridge_returns_writer_failure() {
 }
 
 #[tokio::test]
+async fn blank_stdin_line_is_forwarded_to_the_bridge_as_a_parse_error() {
+    // Break caught: stdin ingress silently dropping blank or whitespace-only protocol frames.
+    use tokio::io::{duplex, AsyncReadExt};
+
+    let root = fresh_test_root("blank-stdin-frame");
+    let adapter = test_adapter(&root);
+    let (input, receiver) = tokio::sync::mpsc::unbounded_channel();
+    crate::forward_input_lines(std::io::Cursor::new("\n  \t\n"), input).unwrap();
+
+    let (writer_side, mut reader_side) = duplex(4096);
+    crate::runtime::run_bridge(adapter, receiver, writer_side)
+        .await
+        .unwrap();
+
+    let mut output = String::new();
+    reader_side.read_to_string(&mut output).await.unwrap();
+    let responses: Vec<Value> = output
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 2);
+    assert!(responses
+        .iter()
+        .all(|response| response["error"]["code"] == -32700));
+}
+
+#[tokio::test]
 async fn writer_failure_cancels_active_prompt_and_waits_for_completion() {
     // Break caught: returning a writer error before cancelling and draining active prompts.
     let active = crate::runtime::ActivePrompts::default();
@@ -720,6 +747,10 @@ for ($i = 0; $i -lt $args.Count; $i++) {
 }
 Set-Content -LiteralPath $logFile -Value 'Created conversation 00000000-0000-4000-8000-000000000099' -Encoding utf8
 if ($prompt -eq 'slow') { Start-Sleep -Milliseconds 3000 }
+if ($prompt -eq 'stderr-fail') {
+    [Console]::Error.WriteLine('AGY_STDERR_SECRET_SENTINEL')
+    exit 7
+}
 if ($prompt -eq 'fail') { exit 7 }
 [Console]::Out.WriteLine('fake assistant response')
 "#;
@@ -745,6 +776,10 @@ printf '%s\n' 'Created conversation 00000000-0000-4000-8000-000000000099' > "$lo
 if [ "$prompt" = 'slow' ]; then
   printf '%s\n' 'fake assistant response'
   exec sleep 3
+fi
+if [ "$prompt" = 'stderr-fail' ]; then
+  printf '%s\n' 'AGY_STDERR_SECRET_SENTINEL' >&2
+  exit 7
 fi
 if [ "$prompt" = 'fail' ]; then exit 7; fi
 printf '%s\n' 'fake assistant response'
@@ -967,6 +1002,42 @@ async fn failed_process_run_log_is_retained_after_state_commit() {
 
     assert!(response.error.is_some());
     assert!(run_log_path.exists());
+}
+
+#[tokio::test]
+async fn failed_process_stderr_and_prompt_never_reach_protocol_output() {
+    // Break caught: child stderr or the submitted prompt being reflected into ACP output.
+    let mut harness = ConcurrentHarness::new("sanitized-child-error");
+    let prompt = "stderr-fail";
+    let execution = harness.prepare("session-a", prompt);
+    let outcome = crate::runtime::execute_prompt(
+        execution,
+        Arc::new(AtomicBool::new(false)),
+        harness.output.clone(),
+    )
+    .await;
+    let run_log_path = outcome.run_log_path.clone();
+    let response = crate::runtime::finalize_prompt_outcome(&mut harness.adapter, outcome);
+
+    let response_json = serde_json::to_string(&response).unwrap();
+    let error = response.error.as_ref().unwrap();
+    let message = error["message"].as_str().unwrap();
+    let mut protocol_output = String::new();
+    while let Ok(line) = harness.receiver.try_recv() {
+        protocol_output.push_str(&line);
+    }
+
+    assert_eq!(error["code"], -32000);
+    assert!(message.contains("status"));
+    assert!(message.contains("run log retained at"));
+    assert!(message.contains(&run_log_path.to_string_lossy().to_string()));
+    assert!(message.len() <= 512);
+    assert!(run_log_path.exists());
+    for forbidden in ["AGY_STDERR_SECRET_SENTINEL", prompt] {
+        assert!(!response_json.contains(forbidden));
+        assert!(!message.contains(forbidden));
+        assert!(!protocol_output.contains(forbidden));
+    }
 }
 
 fn test_adapter(root: &std::path::Path) -> Adapter {
@@ -1232,6 +1303,85 @@ fn prepare_prompt_rejects_unknown_session_before_log_creation() {
         .unwrap()
         .join("run-logs")
         .exists());
+}
+
+#[test]
+fn prepare_prompt_rejects_every_invalid_session_id_without_side_effects() {
+    // Break caught: malformed session IDs reaching persistence, cache mutation, or run-log setup.
+    let cases = [
+        (
+            "missing",
+            json!({"prompt": [{"type": "text", "text": "hello"}]}),
+        ),
+        (
+            "null",
+            json!({"sessionId": null, "prompt": [{"type": "text", "text": "hello"}]}),
+        ),
+        (
+            "number",
+            json!({"sessionId": 42, "prompt": [{"type": "text", "text": "hello"}]}),
+        ),
+        (
+            "empty",
+            json!({"sessionId": "", "prompt": [{"type": "text", "text": "hello"}]}),
+        ),
+        (
+            "whitespace",
+            json!({"sessionId": "  \t", "prompt": [{"type": "text", "text": "hello"}]}),
+        ),
+    ];
+
+    for (label, params) in cases {
+        let root = fresh_test_root(&format!("invalid-session-id-{label}"));
+        let blocked_parent = root.join("blocked-state-parent");
+        fs::write(&blocked_parent, b"not a directory").unwrap();
+        let mut adapter = test_adapter(&root);
+        adapter.state_file = blocked_parent.join("sessions.json");
+        let sessions_before = adapter.sessions.clone();
+
+        let error = adapter.prepare_prompt(json!(20), &params).unwrap_err();
+
+        assert_eq!(error.error.as_ref().unwrap()["code"], -32602, "{label}");
+        assert_eq!(adapter.sessions, sessions_before, "{label}");
+        assert!(!blocked_parent.join("sessions.lock").exists(), "{label}");
+        assert!(!blocked_parent.join("run-logs").exists(), "{label}");
+    }
+}
+
+#[test]
+fn malformed_prompt_does_not_restore_a_persisted_nonresident_session() {
+    // Break caught: restoring/evicting session cache state before validating every prompt block.
+    let root = fresh_test_root("malformed-prompt-nonresident");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    let session_id = "persisted-nonresident";
+    let persisted = crate::types::Session {
+        conversation_id: None,
+        last_step_idx: -1,
+        model_id: Some("fake-model".to_string()),
+        cwd,
+    };
+    adapter.persist_session(session_id, &persisted).unwrap();
+    let store_before = adapter.load_store().unwrap();
+    assert!(!adapter.sessions.contains_key(session_id));
+
+    let error = adapter
+        .prepare_prompt(
+            json!(21),
+            &json!({"sessionId": session_id, "prompt": [
+                {"type": "text", "text": "hello"},
+                {"type": "image", "data": "AA==", "mimeType": "image/png"}
+            ]}),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.error.as_ref().unwrap()["code"], -32602);
+    assert!(!adapter.sessions.contains_key(session_id));
+    assert_eq!(
+        adapter.load_store().unwrap().sessions,
+        store_before.sessions
+    );
 }
 
 #[test]

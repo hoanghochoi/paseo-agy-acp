@@ -12,7 +12,7 @@ Zed (ACP host)  <--stdin/stdout JSON-RPC-->  agy-acp  <--subprocess-->  agy  <--
 
 ## Prerequisites
 
-- **Rust** (1.70+) with Cargo
+- A stable **Rust** toolchain with Cargo
 - **`agy`** installed and in your `PATH` — install from [google-antigravity/antigravity-cli releases](https://github.com/google-antigravity/antigravity-cli)
 - **Authentication** — either set `GEMINI_API_KEY` or configure auth via `~/.gemini/antigravity-cli/settings.json`
 
@@ -95,7 +95,7 @@ Non-empty `mcpServers` lists are rejected because `agy-acp` does not currently f
 ## Runtime Guarantees
 
 - ACP `session/new`, `session/load`, and `session/resume` lifecycle requests require both an existing absolute `cwd` and an `mcpServers` array. Only an empty `mcpServers` array is currently supported; missing, malformed, or non-empty values fail explicitly.
-- Prompt executions can run concurrently across different sessions. Within one session, execution is serialized so two subprocesses cannot mutate the same conversation at once.
+- Prompt executions can run concurrently across different sessions. At most one prompt per session may be active; overlapping requests for the same session are rejected rather than queued or serialized.
 - All JSON-RPC responses and `session/update` notifications flow through one stdout writer, preserving complete newline-delimited JSON messages under concurrent activity.
 - Prompt content must be a non-empty array of text blocks with string `text` values. Unsupported, mixed, or malformed content fails explicitly instead of being silently dropped.
 

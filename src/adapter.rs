@@ -18,6 +18,34 @@ fn persistence_error(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::error(id, -32603, PERSISTENCE_FAILURE_MESSAGE)
 }
 
+fn validate_session_id(params: &Value) -> Option<&str> {
+    params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.trim().is_empty())
+}
+
+fn validate_prompt_text(params: &Value) -> Result<String, &'static str> {
+    let Some(blocks) = params.get("prompt").and_then(Value::as_array) else {
+        return Err("prompt must be an array of text blocks");
+    };
+    let mut text_blocks = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            return Err("only text prompt blocks are supported");
+        }
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            return Err("text prompt blocks must contain string text");
+        };
+        text_blocks.push(text);
+    }
+    let prompt_text = text_blocks.join("\n").trim().to_string();
+    if prompt_text.is_empty() {
+        return Err("prompt text must not be empty");
+    }
+    Ok(prompt_text)
+}
+
 fn session_from_stored(stored: StoredSession, cwd: PathBuf) -> Session {
     Session {
         conversation_id: stored.conversation_id,
@@ -414,20 +442,17 @@ impl Adapter {
     }
 
     pub fn handle_session_load(&mut self, id: Value, params: &Value) -> Vec<String> {
-        let session_id = params
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if session_id.is_empty() {
+        let Some(session_id) = validate_session_id(params) else {
             return vec![serde_json::to_string(&JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
                 result: None,
-                error: Some(json!({"code":-32602,"message":"missing sessionId"})),
+                error: Some(
+                    json!({"code":-32602,"message":"sessionId must be a non-empty string"}),
+                ),
             })
             .unwrap()];
-        }
+        };
 
         let cwd = match validate_session_setup(params) {
             Ok(cwd) => cwd,
@@ -501,19 +526,16 @@ impl Adapter {
     }
 
     pub fn handle_session_resume(&mut self, id: Value, params: &Value) -> JsonRpcResponse {
-        let session_id = params
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if session_id.is_empty() {
+        let Some(session_id) = validate_session_id(params) else {
             return JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
                 result: None,
-                error: Some(json!({"code":-32602,"message":"missing sessionId"})),
+                error: Some(
+                    json!({"code":-32602,"message":"sessionId must be a non-empty string"}),
+                ),
             };
-        }
+        };
 
         let cwd = match validate_session_setup(params) {
             Ok(cwd) => cwd,
@@ -550,10 +572,7 @@ impl Adapter {
     }
 
     pub fn handle_session_set_model(&mut self, id: Value, params: &Value) -> JsonRpcResponse {
-        let session_id = params
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let session_id = validate_session_id(params).unwrap_or("");
         let model_id = params.get("modelId").and_then(|v| v.as_str()).unwrap_or("");
 
         if session_id.is_empty() || model_id.is_empty() {
@@ -600,10 +619,7 @@ impl Adapter {
         id: Value,
         params: &Value,
     ) -> JsonRpcResponse {
-        let session_id = params
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let session_id = validate_session_id(params).unwrap_or("");
         let config_id = params
             .get("configId")
             .and_then(|v| v.as_str())
@@ -670,12 +686,19 @@ impl Adapter {
         id: Value,
         params: &Value,
     ) -> Result<PromptExecution, JsonRpcResponse> {
-        let session_id = params
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let Some(session_id) = validate_session_id(params) else {
+            return Err(JsonRpcResponse::error(
+                id,
+                -32602,
+                "sessionId must be a non-empty string",
+            ));
+        };
+        let prompt_text = match validate_prompt_text(params) {
+            Ok(prompt_text) => prompt_text,
+            Err(message) => return Err(JsonRpcResponse::error(id, -32602, message)),
+        };
 
-        if !session_id.is_empty() && !self.sessions.contains_key(session_id) {
+        if !self.sessions.contains_key(session_id) {
             if self.restore_session_state(session_id, None).is_err() {
                 return Err(persistence_error(id));
             }
@@ -692,40 +715,6 @@ impl Adapter {
         let conversation_id = session.conversation_id.clone();
         let model_id = session.model_id.clone();
         let initial_step_idx = session.last_step_idx;
-
-        let Some(blocks) = params.get("prompt").and_then(Value::as_array) else {
-            return Err(JsonRpcResponse::error(
-                id,
-                -32602,
-                "prompt must be an array of text blocks",
-            ));
-        };
-        let mut text_blocks = Vec::with_capacity(blocks.len());
-        for block in blocks {
-            if block.get("type").and_then(Value::as_str) != Some("text") {
-                return Err(JsonRpcResponse::error(
-                    id,
-                    -32602,
-                    "only text prompt blocks are supported",
-                ));
-            }
-            let Some(text) = block.get("text").and_then(Value::as_str) else {
-                return Err(JsonRpcResponse::error(
-                    id,
-                    -32602,
-                    "text prompt blocks must contain string text",
-                ));
-            };
-            text_blocks.push(text);
-        }
-        let prompt_text = text_blocks.join("\n").trim().to_string();
-        if prompt_text.is_empty() {
-            return Err(JsonRpcResponse::error(
-                id,
-                -32602,
-                "prompt text must not be empty",
-            ));
-        }
 
         let state_dir = self
             .state_file

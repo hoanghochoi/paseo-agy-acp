@@ -248,11 +248,9 @@ pub(crate) async fn execute_prompt(
 
     let mut stderr = child.stderr.take();
     let stderr_reader = tokio::spawn(async move {
-        let mut buf = Vec::new();
         if let Some(mut stderr) = stderr.take() {
-            let _ = stderr.read_to_end(&mut buf).await;
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
         }
-        buf
     });
 
     let streaming_state = Arc::new(Mutex::new(StreamingState {
@@ -306,7 +304,7 @@ pub(crate) async fn execute_prompt(
     };
     let stdout_bytes = stdout_reader.await.unwrap_or_default();
     let stdout_text = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
-    let stderr_bytes = stderr_reader.await.unwrap_or_default();
+    let _ = stderr_reader.await;
     stop_polling.store(true, Ordering::SeqCst);
     poller.wait().await;
 
@@ -363,11 +361,6 @@ pub(crate) async fn execute_prompt(
     );
     let response = match result {
         Ok(status) => {
-            let stderr_text = String::from_utf8_lossy(&stderr_bytes);
-            if !stderr_text.is_empty() {
-                eprintln!("[agy-acp] agy stderr: {}", stderr_text.trim_end());
-            }
-
             if !was_cancelled && run_timed_out {
                 JsonRpcResponse::error(
                     id,
@@ -378,12 +371,11 @@ pub(crate) async fn execute_prompt(
                     ),
                 )
             } else if !was_cancelled && !status.success() {
-                eprintln!("[agy-acp] WARN: agy exited with status: {status}");
-                let message = if stderr_text.is_empty() {
-                    format!("agy exited with status: {status}")
-                } else {
-                    format!("agy failed: {}", stderr_text.trim_end())
-                };
+                let message = format!(
+                    "agy exited with status {status}; run log retained at {}",
+                    run_log_path.display()
+                );
+                eprintln!("[agy-acp] WARN: {message}");
                 JsonRpcResponse::error(id, -32000, &message)
             } else if !was_cancelled && bound_conv_id.is_none() {
                 JsonRpcResponse::error(
