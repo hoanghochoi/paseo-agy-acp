@@ -2,7 +2,6 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -16,6 +15,7 @@ use uuid::Uuid;
 #[cfg(test)]
 use crate::db::read_delta_from_db;
 use crate::db::read_replay_updates_from_db;
+use crate::output::OutputSender;
 use crate::streaming::poll_streaming_delta;
 use crate::types::*;
 
@@ -759,19 +759,22 @@ impl Adapter {
         id: Value,
         params: &Value,
         cancelled: Arc<AtomicBool>,
-    ) -> Vec<String> {
+        output: OutputSender,
+    ) -> JsonRpcResponse {
         let execution = match self.prepare_prompt(id, params) {
             Ok(execution) => execution,
-            Err(error) => return vec![serde_json::to_string(&error).unwrap()],
+            Err(error) => return error,
         };
-        self.handle_prepared_prompt(execution, cancelled).await
+        self.handle_prepared_prompt(execution, cancelled, output)
+            .await
     }
 
     pub(crate) async fn handle_prepared_prompt(
         &mut self,
         execution: PromptExecution,
         cancelled: Arc<AtomicBool>,
-    ) -> Vec<String> {
+        output: OutputSender,
+    ) -> JsonRpcResponse {
         let PromptExecution {
             id,
             session_id,
@@ -819,13 +822,12 @@ impl Adapter {
         let mut child = match spawn_result {
             Ok(child) => child,
             Err(e) => {
-                return vec![serde_json::to_string(&JsonRpcResponse {
+                return JsonRpcResponse {
                     jsonrpc: "2.0",
                     id,
                     result: None,
                     error: Some(json!({"code":-32000,"message":format!("failed to run agy: {e}")})),
-                })
-                .unwrap()];
+                };
             }
         };
 
@@ -865,9 +867,9 @@ impl Adapter {
         let poll_session_id = session_id.clone();
         let poll_state = Arc::clone(&streaming_state);
         let poll_stop = Arc::clone(&stop_polling);
+        let poll_output = output.clone();
 
         let poller = std::thread::spawn(move || {
-            let mut stdout = io::stdout();
             while !poll_stop.load(Ordering::SeqCst) {
                 for line in poll_streaming_delta(
                     &poll_conversations_dir,
@@ -875,9 +877,10 @@ impl Adapter {
                     &poll_session_id,
                     &poll_state,
                 ) {
-                    let _ = writeln!(stdout, "{}", line);
+                    if poll_output.blocking_send(line).is_err() {
+                        return;
+                    }
                 }
-                let _ = stdout.flush();
                 std::thread::sleep(Duration::from_millis(500));
             }
         });
@@ -935,12 +938,10 @@ impl Adapter {
             state.had_agent_text = true;
         }
 
-        {
-            let mut stdout = io::stdout();
-            for line in &final_lines {
-                let _ = writeln!(stdout, "{}", line);
+        for line in final_lines {
+            if output.send(line).await.is_err() {
+                break;
             }
-            let _ = stdout.flush();
         }
 
         let state = streaming_state.lock().unwrap();
@@ -972,13 +973,12 @@ impl Adapter {
         } else {
             "end_turn"
         };
-        let output_lines = vec![serde_json::to_string(&JsonRpcResponse {
+        let response = JsonRpcResponse {
             jsonrpc: "2.0",
             id: id.clone(),
             result: Some(json!({ "stopReason": stop_reason })),
             error: None,
-        })
-        .unwrap()];
+        };
 
         match result {
             Ok(status) => {
@@ -988,7 +988,7 @@ impl Adapter {
                 }
 
                 if !was_cancelled && run_timed_out {
-                    return vec![serde_json::to_string(&JsonRpcResponse {
+                    return JsonRpcResponse {
                         jsonrpc: "2.0",
                         id,
                         result: None,
@@ -999,8 +999,7 @@ impl Adapter {
                                 run_log_path.display()
                             ),
                         })),
-                    })
-                    .unwrap()];
+                    };
                 }
 
                 if !was_cancelled && !status.success() {
@@ -1010,17 +1009,16 @@ impl Adapter {
                     } else {
                         format!("agy failed: {}", stderr_text.trim_end())
                     };
-                    return vec![serde_json::to_string(&JsonRpcResponse {
+                    return JsonRpcResponse {
                         jsonrpc: "2.0",
                         id,
                         result: None,
                         error: Some(json!({"code":-32000,"message":msg})),
-                    })
-                    .unwrap()];
+                    };
                 }
 
                 if !was_cancelled && bound_conv_id.is_none() {
-                    return vec![serde_json::to_string(&JsonRpcResponse {
+                    return JsonRpcResponse {
                         jsonrpc: "2.0",
                         id,
                         result: None,
@@ -1031,12 +1029,11 @@ impl Adapter {
                                 run_log_path.display()
                             ),
                         })),
-                    })
-                    .unwrap()];
+                    };
                 }
 
                 if !was_cancelled && !had_agent_text {
-                    return vec![serde_json::to_string(&JsonRpcResponse {
+                    return JsonRpcResponse {
                         jsonrpc: "2.0",
                         id,
                         result: None,
@@ -1044,25 +1041,23 @@ impl Adapter {
                             "code": -32000,
                             "message": "agy completed without an assistant response",
                         })),
-                    })
-                    .unwrap()];
+                    };
                 }
             }
             Err(e) => {
-                return vec![serde_json::to_string(&JsonRpcResponse {
+                return JsonRpcResponse {
                     jsonrpc: "2.0",
                     id,
                     result: None,
                     error: Some(
                         json!({"code":-32000,"message":format!("failed to wait for agy: {e}")}),
                     ),
-                })
-                .unwrap()];
+                };
             }
         }
 
         let _ = fs::remove_file(&run_log_path);
-        output_lines
+        response
     }
 }
 

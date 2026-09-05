@@ -5,6 +5,25 @@ use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+#[tokio::test]
+async fn output_writer_emits_complete_lines_in_channel_order() {
+    use tokio::io::{duplex, AsyncReadExt};
+
+    let (writer_side, mut reader_side) = duplex(4096);
+    let (sender, receiver) = crate::output::channel();
+    let writer = tokio::spawn(crate::output::write_messages(writer_side, receiver));
+    sender.send("{\"id\":1}".to_string()).await.unwrap();
+    sender
+        .send("{\"method\":\"session/update\"}".to_string())
+        .await
+        .unwrap();
+    drop(sender);
+    writer.await.unwrap().unwrap();
+    let mut output = String::new();
+    reader_side.read_to_string(&mut output).await.unwrap();
+    assert_eq!(output, "{\"id\":1}\n{\"method\":\"session/update\"}\n");
+}
+
 use crate::adapter::{filter_narration, Adapter};
 use crate::protobuf::{
     extract_text_from_step_payload, extract_thought_from_step_payload,

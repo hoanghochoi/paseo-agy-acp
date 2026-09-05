@@ -1,5 +1,6 @@
 mod adapter;
 mod db;
+mod output;
 mod protobuf;
 mod protocol;
 mod streaming;
@@ -10,7 +11,7 @@ mod tests;
 
 use serde_json::json;
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -42,7 +43,9 @@ async fn main() {
         Arc::new(Mutex::new(HashMap::new()));
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Option<String>>();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<()>();
+    let (output_tx, output_rx) = output::channel();
+    let output_writer = tokio::spawn(output::write_messages(tokio::io::stdout(), output_rx));
     std::thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
@@ -58,11 +61,10 @@ async fn main() {
         }
     });
 
-    let mut stdout = io::stdout();
     let mut stdin_open = true;
     let mut pending_prompts = 0usize;
 
-    loop {
+    'main_loop: loop {
         if !stdin_open && pending_prompts == 0 {
             break;
         }
@@ -71,11 +73,7 @@ async fn main() {
             tokio::select! {
                 output = out_rx.recv() => {
                     match output {
-                        Some(Some(line)) => {
-                            let _ = writeln!(stdout, "{}", line);
-                            let _ = stdout.flush();
-                        }
-                        Some(None) => pending_prompts = pending_prompts.saturating_sub(1),
+                        Some(()) => pending_prompts = pending_prompts.saturating_sub(1),
                         None => {}
                     }
                     continue;
@@ -92,24 +90,14 @@ async fn main() {
             }
         } else {
             match out_rx.recv().await {
-                Some(Some(line)) => {
-                    let _ = writeln!(stdout, "{}", line);
-                    let _ = stdout.flush();
-                }
-                Some(None) => pending_prompts = pending_prompts.saturating_sub(1),
+                Some(()) => pending_prompts = pending_prompts.saturating_sub(1),
                 None => break,
             }
             continue;
         };
 
-        while let Ok(output) = out_rx.try_recv() {
-            match output {
-                Some(line) => {
-                    let _ = writeln!(stdout, "{}", line);
-                    let _ = stdout.flush();
-                }
-                None => pending_prompts = pending_prompts.saturating_sub(1),
-            }
+        while out_rx.try_recv().is_ok() {
+            pending_prompts = pending_prompts.saturating_sub(1);
         }
 
         let req: JsonRpcRequest = match serde_json::from_str(&line) {
@@ -173,19 +161,20 @@ async fn main() {
                 let adapter = Arc::clone(&adapter);
                 let active_cancellations = Arc::clone(&active_cancellations);
                 let out_tx = out_tx.clone();
+                let output_tx = output_tx.clone();
                 pending_prompts += 1;
                 tokio::spawn(async move {
-                    let output = {
+                    let response = {
                         let mut adapter = adapter.lock().await;
-                        adapter.handle_session_prompt(id, &params, cancelled).await
+                        adapter
+                            .handle_session_prompt(id, &params, cancelled, output_tx.clone())
+                            .await
                     };
                     if !session_id.is_empty() {
                         active_cancellations.lock().unwrap().remove(&session_id);
                     }
-                    for line in output {
-                        let _ = out_tx.send(Some(line));
-                    }
-                    let _ = out_tx.send(None);
+                    let _ = output::send_response(&output_tx, response).await;
+                    let _ = out_tx.send(());
                 });
                 Vec::new()
             }
@@ -237,8 +226,17 @@ async fn main() {
         };
 
         for line in output {
-            let _ = writeln!(stdout, "{}", line);
+            if output_tx.send(line).await.is_err() {
+                eprintln!("[agy-acp] output writer stopped");
+                break 'main_loop;
+            }
         }
-        let _ = stdout.flush();
+    }
+
+    drop(output_tx);
+    match output_writer.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("[agy-acp] output writer failed: {error}"),
+        Err(error) => eprintln!("[agy-acp] output writer task failed: {error}"),
     }
 }
