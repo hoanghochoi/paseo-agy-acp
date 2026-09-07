@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "ACP stdio adapter for Google Antigravity CLI (agy)"
+readme = "README.md"
+repository = "https://github.com/hoanghochoi/paseo-agy-acp"
+homepage = "https://github.com/hoanghochoi/paseo-agy-acp"
+documentation = "https://docs.rs/agy-acp"
+keywords = ["acp", "agent", "gemini", "json-rpc", "zed"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -113,6 +113,8 @@ Run the default unit suite with `cargo test`. To include filesystem-backed ignor
 cargo test -- --include-ignored --skip test_e2e_
 ```
 
+GitHub Actions runs the formatting, Clippy, unit/I/O test, and release-build gates on Ubuntu and Windows. Authenticated E2E coverage remains a local/Paseo gate because it requires an `agy` installation and user authentication.
+
 ## Debugging
 
 To inspect the JSON-RPC messages between Zed and `agy-acp`, run `dev: open acp logs` from Zed's Command Palette.

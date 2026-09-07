@@ -10,9 +10,11 @@ cargo build --release          # release build (required for e2e tests)
 cargo test                     # unit tests only (fast, no I/O)
 cargo test -- --include-ignored  # all tests including filesystem I/O tests
 cargo test e2e -- --ignored --nocapture  # e2e only (needs agy binary + auth)
+cargo fmt -- --check           # formatting gate
+cargo clippy --all-targets -- -D warnings  # lint gate
 ```
 
-No separate lint/typecheck/format commands — just `cargo build` and `cargo test`.
+GitHub Actions runs the format, Clippy, unit/I/O test, and release-build gates on Ubuntu and Windows. Authenticated E2E remains a local/Paseo gate because it requires an `agy` installation and user authentication.
 
 ## Architecture
 
