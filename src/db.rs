@@ -102,7 +102,12 @@ pub fn read_rows_from_db(
     conversation_id: &str,
     after_step_idx: i64,
 ) -> Option<Vec<(i64, i64, Vec<u8>)>> {
-    let db_path = conversations_dir.join(format!("{}.db", conversation_id));
+    // Conversation IDs originate from agy logs/state, but they are still
+    // untrusted path components. Parse and normalize the UUID before joining
+    // it to the conversations directory so traversal or absolute paths can
+    // never escape the intended database root.
+    let conversation_uuid = Uuid::parse_str(conversation_id).ok()?;
+    let db_path = conversations_dir.join(format!("{conversation_uuid}.db"));
     let conn = Connection::open_with_flags(
         &db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,

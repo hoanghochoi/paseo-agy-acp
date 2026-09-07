@@ -1,15 +1,18 @@
 use serde_json::{json, Value};
 
+const MAX_FIELD_NUMBER: u64 = (1 << 29) - 1;
+
 /// Read a protobuf varint, returning (value, bytes_consumed).
 pub fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
-    let mut result: u64 = 0;
-    let mut shift = 0;
+    let mut result = 0u64;
     for (i, &byte) in buf.iter().enumerate() {
-        if shift >= 70 {
+        // A u64 varint is at most ten bytes. The tenth byte has only one
+        // payload bit available (bits 0..=63); any other payload or a
+        // continuation bit would overflow the value.
+        if i >= 10 || (i == 9 && byte > 1) {
             return None;
         }
-        result |= ((byte & 0x7F) as u64) << shift;
-        shift += 7;
+        result |= u64::from(byte & 0x7F) << (i * 7);
         if byte & 0x80 == 0 {
             return Some((result, i + 1));
         }
@@ -17,41 +20,53 @@ pub fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
+fn read_varint_at(blob: &[u8], cursor: &mut usize) -> Option<u64> {
+    let start = *cursor;
+    let (value, consumed) = read_varint(blob.get(start..)?)?;
+    *cursor = start.checked_add(consumed)?;
+    Some(value)
+}
+
+fn take_bytes<'a>(blob: &'a [u8], cursor: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let start = *cursor;
+    let end = start.checked_add(len)?;
+    let bytes = blob.get(start..end)?;
+    *cursor = end;
+    Some(bytes)
+}
+
 /// Extract the first length-delimited field with the given number from a protobuf blob.
 pub fn get_proto_field(blob: &[u8], target: u64) -> Option<Vec<u8>> {
     let mut i = 0;
+    let mut found = None;
     while i < blob.len() {
-        let (tag, consumed) = read_varint(&blob[i..])?;
-        i += consumed;
+        let tag = read_varint_at(blob, &mut i)?;
         let field_number = tag >> 3;
         let wire_type = tag & 0x7;
+        if field_number == 0 || field_number > MAX_FIELD_NUMBER {
+            return None;
+        }
         match wire_type {
             0 => {
-                let (_, c) = read_varint(&blob[i..])?;
-                i += c;
+                read_varint_at(blob, &mut i)?;
             }
             2 => {
-                let (len, c) = read_varint(&blob[i..])?;
-                i += c;
-                let len = len as usize;
-                if i + len > blob.len() {
-                    return None;
+                let len = usize::try_from(read_varint_at(blob, &mut i)?).ok()?;
+                let bytes = take_bytes(blob, &mut i, len)?;
+                if field_number == target && found.is_none() {
+                    found = Some(bytes.to_vec());
                 }
-                if field_number == target {
-                    return Some(blob[i..i + len].to_vec());
-                }
-                i += len;
             }
             5 => {
-                i += 4;
+                take_bytes(blob, &mut i, 4)?;
             }
             1 => {
-                i += 8;
+                take_bytes(blob, &mut i, 8)?;
             }
             _ => return None,
         }
     }
-    None
+    found
 }
 
 pub fn get_text_field(blob: &[u8], target: u64) -> Option<String> {
@@ -59,67 +74,51 @@ pub fn get_text_field(blob: &[u8], target: u64) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn get_proto_fields(blob: &[u8], target: u64) -> Vec<Vec<u8>> {
+fn get_proto_fields(blob: &[u8], target: u64) -> Option<Vec<Vec<u8>>> {
     let mut i = 0;
     let mut fields = Vec::new();
     while i < blob.len() {
-        let Some((tag, consumed)) = read_varint(&blob[i..]) else {
-            return fields;
-        };
-        i += consumed;
+        let tag = read_varint_at(blob, &mut i)?;
         let field_number = tag >> 3;
         let wire_type = tag & 0x7;
+        if field_number == 0 || field_number > MAX_FIELD_NUMBER {
+            return None;
+        }
         match wire_type {
             0 => {
                 let start = i;
-                let Some((_, c)) = read_varint(&blob[i..]) else {
-                    return fields;
-                };
+                let _ = read_varint_at(blob, &mut i)?;
                 if field_number == target {
-                    fields.push(blob[start..start + c].to_vec());
+                    fields.push(blob.get(start..i)?.to_vec());
                 }
-                i += c;
             }
             2 => {
-                let Some((len, c)) = read_varint(&blob[i..]) else {
-                    return fields;
-                };
-                i += c;
-                let len = len as usize;
-                if i + len > blob.len() {
-                    return fields;
-                }
+                let len = usize::try_from(read_varint_at(blob, &mut i)?).ok()?;
+                let bytes = take_bytes(blob, &mut i, len)?;
                 if field_number == target {
-                    fields.push(blob[i..i + len].to_vec());
+                    fields.push(bytes.to_vec());
                 }
-                i += len;
             }
             5 => {
-                if i + 4 > blob.len() {
-                    return fields;
-                }
+                let bytes = take_bytes(blob, &mut i, 4)?;
                 if field_number == target {
-                    fields.push(blob[i..i + 4].to_vec());
+                    fields.push(bytes.to_vec());
                 }
-                i += 4;
             }
             1 => {
-                if i + 8 > blob.len() {
-                    return fields;
-                }
+                let bytes = take_bytes(blob, &mut i, 8)?;
                 if field_number == target {
-                    fields.push(blob[i..i + 8].to_vec());
+                    fields.push(bytes.to_vec());
                 }
-                i += 8;
             }
-            _ => return fields,
+            _ => return None,
         }
     }
-    fields
+    Some(fields)
 }
 
 fn get_varint_field(blob: &[u8], target: u64) -> Option<u64> {
-    let bytes = get_proto_fields(blob, target).into_iter().next()?;
+    let bytes = get_proto_fields(blob, target)?.into_iter().next()?;
     read_varint(&bytes).map(|(value, _)| value)
 }
 
@@ -466,7 +465,10 @@ fn parse_tool_run(blob: &[u8]) -> Option<ParsedToolRun> {
 }
 
 fn parse_search_hits(grep: &[u8]) -> Vec<Value> {
-    get_proto_fields(grep, 4)
+    let Some(fields) = get_proto_fields(grep, 4) else {
+        return Vec::new();
+    };
+    fields
         .into_iter()
         .map(|hit| {
             let mut out = json!({});
@@ -539,6 +541,7 @@ fn parse_tool_result(blob: &[u8]) -> Option<Value> {
             out["dirUri"] = json!(dir_uri);
         }
         let entries: Vec<Value> = get_proto_fields(&list, 3)
+            .unwrap_or_default()
             .into_iter()
             .map(|entry| {
                 json!({

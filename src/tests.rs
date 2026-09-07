@@ -28,7 +28,7 @@ use crate::adapter::{filter_narration, Adapter};
 use crate::protobuf::{
     extract_text_from_step_payload, extract_thought_from_step_payload,
     extract_title_from_step_payload, extract_tool_name, extract_tool_update_from_step_payload,
-    extract_user_text_from_step_payload, is_tool_step_type, read_varint,
+    extract_user_text_from_step_payload, get_proto_field, is_tool_step_type, read_varint,
 };
 use crate::protocol::{parse_jsonrpc_line, IncomingMessage};
 use crate::types::{CommandSpec, JsonRpcResponse, SessionStore, StoredSession};
@@ -1350,7 +1350,10 @@ fn session_load_persistence_failure_preserves_memory_and_emits_no_replay() {
     fs::create_dir_all(&new_cwd).unwrap();
     let mut adapter = test_adapter(&root);
     fs::create_dir_all(&adapter.conversations_dir).unwrap();
-    let replay_db = adapter.conversations_dir.join("conversation-load.db");
+    let conversation_id = "00000000-0000-4000-8000-000000000013";
+    let replay_db = adapter
+        .conversations_dir
+        .join(format!("{conversation_id}.db"));
     let connection = Connection::open(&replay_db).unwrap();
     connection
         .execute_batch(
@@ -1371,7 +1374,7 @@ fn session_load_persistence_failure_preserves_memory_and_emits_no_replay() {
     adapter.sessions.insert(
         "load-session".to_string(),
         crate::types::Session {
-            conversation_id: Some("conversation-load".to_string()),
+            conversation_id: Some(conversation_id.to_string()),
             last_step_idx: 7,
             model_id: Some("old-model".to_string()),
             cwd: old_cwd.clone(),
@@ -2042,7 +2045,8 @@ fn poller_advances_tail_cursor_without_replaying_or_missing_incremental_text() {
     let conversations_dir = root.join("conversations");
     fs::create_dir_all(&conversations_dir).unwrap();
 
-    let db_path = conversations_dir.join("conv.db");
+    let conversation_id = "00000000-0000-4000-8000-000000000020";
+    let db_path = conversations_dir.join(format!("{conversation_id}.db"));
     let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch(
         "CREATE TABLE steps (
@@ -2070,7 +2074,7 @@ fn poller_advances_tail_cursor_without_replaying_or_missing_incremental_text() {
     drop(conn);
 
     let state = Arc::new(Mutex::new(crate::types::StreamingState {
-        conversation_id: Some("conv".to_string()),
+        conversation_id: Some(conversation_id.to_string()),
         base_step_idx: -1,
         last_step_idx: -1,
         ..Default::default()
@@ -2143,7 +2147,8 @@ fn poller_prunes_stale_streaming_bookkeeping_after_tail_advance() {
     let conversations_dir = root.join("conversations");
     fs::create_dir_all(&conversations_dir).unwrap();
 
-    let db_path = conversations_dir.join("conv.db");
+    let conversation_id = "00000000-0000-4000-8000-000000000021";
+    let db_path = conversations_dir.join(format!("{conversation_id}.db"));
     let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch(
         "CREATE TABLE steps (
@@ -2219,7 +2224,7 @@ fn poller_prunes_stale_streaming_bookkeeping_after_tail_advance() {
     drop(conn);
 
     let state = Arc::new(Mutex::new(crate::types::StreamingState {
-        conversation_id: Some("conv".to_string()),
+        conversation_id: Some(conversation_id.to_string()),
         base_step_idx: -1,
         last_step_idx: -1,
         ..Default::default()
@@ -2679,6 +2684,113 @@ fn test_read_varint() {
 }
 
 #[test]
+fn test_malformed_structured_grep_does_not_emit_partial_hits() {
+    let mut hit = Vec::new();
+    push_len_field(&mut hit, 1, b"src/protobuf.rs");
+
+    let mut grep = Vec::new();
+    push_len_field(&mut grep, 1, b"parse_tool_result");
+    push_len_field(&mut grep, 4, &hit);
+    // A second hit declares three bytes but only contains one. The malformed
+    // payload must invalidate the whole repeated-field scan instead of
+    // leaking the first, otherwise-valid hit.
+    grep.extend_from_slice(&[0x22, 0x03, b'x']);
+
+    let payload = make_tool_payload(
+        "grep-malformed-call",
+        "grep_search",
+        r#"{"SearchPath":"/tmp/project/src","toolAction":"Searching parser"}"#,
+        "Parser search",
+        Some((13, grep)),
+    );
+
+    let update = extract_tool_update_from_step_payload(28, 7, &payload).unwrap();
+    assert!(update["rawOutput"].get("hits").is_none());
+    assert_eq!(
+        update["content"][0]["content"]["text"],
+        "```\nNo matches\n```"
+    );
+}
+
+#[test]
+fn test_malformed_structured_list_does_not_emit_partial_entries() {
+    let mut entry = Vec::new();
+    push_len_field(&mut entry, 1, b"README.md");
+
+    let mut list = Vec::new();
+    push_len_field(&mut list, 1, b"file:///tmp/project");
+    push_len_field(&mut list, 3, &entry);
+    list.extend_from_slice(&[0x1A, 0x03, b'x']);
+
+    let payload = make_tool_payload(
+        "list-malformed-call",
+        "list_directory",
+        r#"{"dirUri":"file:///tmp/project"}"#,
+        "List project",
+        Some((15, list)),
+    );
+
+    let update = extract_tool_update_from_step_payload(29, 8, &payload).unwrap();
+    assert!(update["rawOutput"].get("entries").is_none());
+    assert_eq!(
+        update["content"][0]["content"]["text"],
+        "```\n(empty directory)\n```"
+    );
+}
+
+#[test]
+fn test_read_varint_rejects_u64_overflow() {
+    assert_eq!(
+        read_varint(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]),
+        Some((u64::MAX, 10))
+    );
+    assert_eq!(
+        read_varint(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02]),
+        None
+    );
+    assert_eq!(
+        read_varint(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]),
+        None
+    );
+}
+
+#[test]
+fn test_proto_length_field_too_large_fails_closed() {
+    let mut blob = vec![0xA2, 0x01];
+    blob.extend([0xFF; 9]);
+    blob.push(0x01);
+    assert_eq!(extract_text_from_step_payload(&blob), None);
+}
+
+#[test]
+fn test_proto_fixed_width_field_truncation_fails_closed() {
+    assert_eq!(get_proto_field(&[0x09, 1, 2, 3], 1), None);
+    assert_eq!(get_proto_field(&[0x0D, 1, 2, 3], 1), None);
+}
+
+#[test]
+fn test_proto_nested_payload_truncation_fails_closed() {
+    let blob = vec![0xA2, 0x01, 0x02, 0x0A, 0x01];
+    assert_eq!(extract_text_from_step_payload(&blob), None);
+}
+
+#[test]
+fn test_proto_trailing_truncation_invalidates_preceding_target() {
+    let mut blob = make_assistant_payload("hello");
+    blob.extend_from_slice(&[0x22, 0x03, b'x']);
+    assert_eq!(extract_text_from_step_payload(&blob), None);
+}
+
+#[test]
+fn test_proto_field_number_overflow_invalidates_preceding_target() {
+    let mut blob = make_assistant_payload("hello");
+    let invalid_tag = ((1u64 << 29) << 3) | 2;
+    push_varint(&mut blob, invalid_tag);
+    push_varint(&mut blob, 0);
+    assert_eq!(extract_text_from_step_payload(&blob), None);
+}
+
+#[test]
 fn test_initialize_advertises_load_session_support() {
     let adapter = Adapter::new();
     let response = adapter.handle_initialize(json!(1));
@@ -2778,7 +2890,8 @@ fn test_session_load_replays_conversation_history() {
     let conv_dir = root.join("conversations");
     fs::create_dir_all(&conv_dir).unwrap();
 
-    let db_path = conv_dir.join("conv-replay.db");
+    let conversation_id = "00000000-0000-4000-8000-000000000022";
+    let db_path = conv_dir.join(format!("{conversation_id}.db"));
     let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch(
         "CREATE TABLE steps (
@@ -2876,7 +2989,7 @@ fn test_session_load_replays_conversation_history() {
         .persist_session(
             "sess-replay",
             &crate::types::Session {
-                conversation_id: Some("conv-replay".to_string()),
+                conversation_id: Some(conversation_id.to_string()),
                 last_step_idx: 9,
                 model_id: None,
                 cwd: root.clone(),
@@ -3308,7 +3421,8 @@ fn test_read_response_from_db() {
     let conv_dir = root.join("conversations");
     fs::create_dir_all(&conv_dir).unwrap();
 
-    let db_path = conv_dir.join("test-conv.db");
+    let conversation_id = "00000000-0000-4000-8000-000000000010";
+    let db_path = conv_dir.join(format!("{conversation_id}.db"));
     let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch(
         "CREATE TABLE steps (
@@ -3350,10 +3464,10 @@ fn test_read_response_from_db() {
     let mut adapter = test_adapter(&root);
     adapter.conversations_dir = conv_dir;
 
-    let result = adapter.read_response_from_db("test-conv", -1);
+    let result = adapter.read_response_from_db(conversation_id, -1);
     assert_eq!(result, Some(("hello world".to_string(), 2)));
 
-    let result = adapter.read_response_from_db("test-conv", 1);
+    let result = adapter.read_response_from_db(conversation_id, 1);
     assert_eq!(result, None);
 
     let _ = fs::remove_dir_all(root);
@@ -3868,7 +3982,8 @@ fn test_read_response_multi_step_no_skip_no_duplicate() {
     let conv_dir = root.join("conversations");
     fs::create_dir_all(&conv_dir).unwrap();
 
-    let db_path = conv_dir.join("multi.db");
+    let conversation_id = "00000000-0000-4000-8000-000000000011";
+    let db_path = conv_dir.join(format!("{conversation_id}.db"));
     let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch(
         "CREATE TABLE steps (
@@ -3945,19 +4060,19 @@ fn test_read_response_multi_step_no_skip_no_duplicate() {
     let mut adapter = test_adapter(&root);
     adapter.conversations_dir = conv_dir;
 
-    let result = adapter.read_response_from_db("multi", -1);
+    let result = adapter.read_response_from_db(conversation_id, -1);
     assert_eq!(
         result,
         Some(("hello\nworld\nline1\nline2\nline3".to_string(), 5))
     );
 
-    let result = adapter.read_response_from_db("multi", 2);
+    let result = adapter.read_response_from_db(conversation_id, 2);
     assert_eq!(result, Some(("world\nline1\nline2\nline3".to_string(), 5)));
 
-    let result = adapter.read_response_from_db("multi", 4);
+    let result = adapter.read_response_from_db(conversation_id, 4);
     assert_eq!(result, Some(("line1\nline2\nline3".to_string(), 5)));
 
-    let result = adapter.read_response_from_db("multi", 5);
+    let result = adapter.read_response_from_db(conversation_id, 5);
     assert_eq!(result, None);
 
     let _ = fs::remove_dir_all(root);
@@ -3970,7 +4085,8 @@ fn test_read_response_missing_steps_table() {
     let conv_dir = root.join("conversations");
     fs::create_dir_all(&conv_dir).unwrap();
 
-    let db_path = conv_dir.join("empty.db");
+    let conversation_id = "00000000-0000-4000-8000-000000000012";
+    let db_path = conv_dir.join(format!("{conversation_id}.db"));
     let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch("CREATE TABLE other (id INTEGER)")
         .unwrap();
@@ -3979,8 +4095,34 @@ fn test_read_response_missing_steps_table() {
     let mut adapter = test_adapter(&root);
     adapter.conversations_dir = conv_dir;
 
-    let result = adapter.read_response_from_db("empty", -1);
+    let result = adapter.read_response_from_db(conversation_id, -1);
     assert_eq!(result, None);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[ignore]
+fn test_read_rows_rejects_invalid_conversation_id_path_traversal() {
+    let root = std::env::temp_dir().join(format!("agy-acp-path-guard-{}", Uuid::new_v4()));
+    let conv_dir = root.join("conversations");
+    fs::create_dir_all(&conv_dir).unwrap();
+
+    // If the raw ID were joined before validation, this database would be
+    // reachable through `conversations/../escape.db`.
+    let outside_path = root.join("escape.db");
+    let conn = Connection::open(&outside_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (
+            idx INTEGER,
+            step_type INTEGER,
+            step_payload BLOB
+        )",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(crate::db::read_rows_from_db(&conv_dir, "../escape", -1).is_none());
 
     let _ = fs::remove_dir_all(root);
 }
