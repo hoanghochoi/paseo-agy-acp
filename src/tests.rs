@@ -1304,7 +1304,7 @@ fn model_discovery_timeout_probe() {
 
     let bin_dir = PathBuf::from(std::env::var_os("AGY_ACP_MODEL_DISCOVERY_BIN").unwrap());
     let parent_path = std::env::var_os("AGY_ACP_MODEL_DISCOVERY_PARENT_PATH").unwrap();
-    let path = std::env::join_paths([bin_dir.as_os_str(), parent_path.as_os_str()]).unwrap();
+    let path = prepend_to_path(&bin_dir, &parent_path);
     std::env::set_var("PATH", path);
 
     let started = std::time::Instant::now();
@@ -1328,7 +1328,7 @@ fn model_discovery_success_probe() {
 
     let bin_dir = PathBuf::from(std::env::var_os("AGY_ACP_MODEL_DISCOVERY_BIN").unwrap());
     let parent_path = std::env::var_os("AGY_ACP_MODEL_DISCOVERY_PARENT_PATH").unwrap();
-    let path = std::env::join_paths([bin_dir.as_os_str(), parent_path.as_os_str()]).unwrap();
+    let path = prepend_to_path(&bin_dir, &parent_path);
     std::env::set_var("PATH", path);
 
     let adapter = Adapter::new();
@@ -1349,11 +1349,17 @@ fn model_discovery_oversized_probe() {
 
     let bin_dir = PathBuf::from(std::env::var_os("AGY_ACP_MODEL_DISCOVERY_BIN").unwrap());
     let parent_path = std::env::var_os("AGY_ACP_MODEL_DISCOVERY_PARENT_PATH").unwrap();
-    let path = std::env::join_paths([bin_dir.as_os_str(), parent_path.as_os_str()]).unwrap();
+    let path = prepend_to_path(&bin_dir, &parent_path);
     std::env::set_var("PATH", path);
 
     let adapter = Adapter::new();
     assert!(adapter.available_models.is_empty());
+}
+
+fn prepend_to_path(bin_dir: &std::path::Path, parent_path: &std::ffi::OsStr) -> std::ffi::OsString {
+    let mut entries = vec![bin_dir.to_path_buf()];
+    entries.extend(std::env::split_paths(parent_path));
+    std::env::join_paths(entries).expect("test probe PATH entries should be valid")
 }
 
 fn launch_model_discovery_probe(

@@ -402,7 +402,7 @@ impl Adapter {
         })
     }
 
-    /// Build the ACP session config option that Zed uses for its model selector.
+    /// Build the ACP session config option that Paseo exposes for model selection.
     pub fn session_config_options_json(&self, model_id: Option<&str>) -> Value {
         let current = model_id
             .map(|model| split_model_entry(model).0)

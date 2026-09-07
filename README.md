@@ -1,13 +1,13 @@
 # agy-acp
 
-An [Agent Client Protocol (ACP)](https://agentclientprotocol.com) stdio adapter for [Google Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) (`agy`). It bridges `agy` into any ACP-compatible host like [Zed](https://zed.dev), enabling you to use Gemini models through `agy` inside Zed's Agent Panel.
+An [Agent Client Protocol (ACP)](https://agentclientprotocol.com) stdio adapter for [Google Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) (`agy`). It is optimized for Paseo-managed workspaces and agents, while remaining compatible with other ACP hosts.
 
 ## How It Works
 
-`agy-acp` speaks JSON-RPC over stdin/stdout (the ACP transport). When a host like Zed sends a prompt, `agy-acp` spawns `agy` as a subprocess, gives that invocation a unique log file so its conversation ID can be bound safely under parallel execution, streams SQLite-backed updates as incremental `session/update` notifications, and persists session state across restarts. Captured `agy --print` stdout supplies the final-answer fallback; missing conversation identity or assistant output is reported as an error rather than a successful empty turn.
+`agy-acp` speaks JSON-RPC over stdin/stdout (the ACP transport). When Paseo sends a prompt for a workspace session, `agy-acp` spawns `agy` in that workspace, gives the invocation a unique log file so its conversation ID can be bound safely under parallel execution, streams SQLite-backed updates as incremental `session/update` notifications, and persists session state across restarts. Captured `agy --print` stdout supplies the final-answer fallback; missing conversation identity or assistant output is reported as an error rather than a successful empty turn.
 
 ```
-Zed (ACP host)  <--stdin/stdout JSON-RPC-->  agy-acp  <--subprocess-->  agy  <--API-->  Gemini
+Paseo workspace/agent (ACP host)  <--stdin/stdout JSON-RPC-->  agy-acp  <--subprocess-->  agy  <--API-->  Gemini
 ```
 
 ## Prerequisites
@@ -28,47 +28,39 @@ The binary is at `target/release/agy-acp`. Copy it somewhere in your `PATH`:
 cp target/release/agy-acp /usr/local/bin/
 ```
 
-## Use with Zed
+For Paseo, prefer configuring the absolute release-binary path so the daemon does not depend on an interactive shell `PATH`:
 
-Add `agy-acp` as a custom agent server in your Zed settings (`~/.config/zed/settings.json`):
-
-```json
-{
-  "agent_servers": {
-    "agy": {
-      "type": "custom",
-      "command": "agy-acp",
-      "args": [],
-      "env": {}
-    }
-  }
-}
+```text
+Windows:  C:\path\to\agy-acp\target\release\agy-acp.exe
+Unix:     /path/to/agy-acp/target/release/agy-acp
 ```
 
-Then open the Agent Panel in Zed (`Cmd-?` on macOS, `Ctrl-?` on Linux), select **agy** from the agent dropdown, and start chatting.
+## Use with Paseo
+
+Configure the Paseo ACP provider/agent to launch the release binary above directly; no shell wrapper is required. Paseo supplies the active workspace directory in each ACP lifecycle request, so the adapter runs `agy` in the same workspace and keeps session state bound to that workspace.
+
+Before starting a Paseo session:
+
+```bash
+cargo build --release
+agy --version
+```
+
+The Paseo daemon account must be able to find `agy` and its authentication. Use either `GEMINI_API_KEY` or the local Antigravity CLI settings/keyring available to that account.
 
 ### Model Selection
 
-`agy-acp` queries available models by running `agy models` at startup. You can switch models from Zed's model selector in the agent thread — the adapter exposes them as ACP config options.
+`agy-acp` queries available models by running `agy models` at startup. Paseo can switch models through the ACP config options (`session/set_model` or `session/setConfigOption`). Discovery is bounded and falls back to an empty model list when `agy` is unavailable.
 
 ### Passing Extra Arguments
 
-Set the `AGY_EXTRA_ARGS` environment variable to pass additional arguments to every `agy` invocation:
+Set `AGY_EXTRA_ARGS` in the Paseo provider environment to pass additional arguments to every `agy` invocation. Values support single/double quotes and backslash escapes without invoking a shell:
 
-```json
-{
-  "agent_servers": {
-    "agy": {
-      "type": "custom",
-      "command": "agy-acp",
-      "args": [],
-      "env": {
-        "AGY_EXTRA_ARGS": "--some-flag value"
-      }
-    }
-  }
-}
+```text
+AGY_EXTRA_ARGS=--some-flag value
 ```
+
+Keep ACP stdout dedicated to protocol messages. Paseo's managed terminal/agent diagnostics and the bounded local invocation logs are the supported debugging surfaces.
 
 ## Environment Variables
 
@@ -80,7 +72,7 @@ Set the `AGY_EXTRA_ARGS` environment variable to pass additional arguments to ev
 
 ## Session Persistence
 
-Sessions are persisted to `~/.openab/agy-acp/sessions.json`, including the absolute working directory supplied by the ACP client. When you resume a session in Zed, `agy-acp` restores the conversation binding and replays the message history from `agy`'s SQLite conversation databases (`~/.gemini/antigravity-cli/conversations/*.db`).
+Sessions are persisted to `~/.openab/agy-acp/sessions.json`, including the absolute working directory supplied by Paseo. When Paseo resumes a session, `agy-acp` restores the conversation binding and replays the message history from `agy`'s SQLite conversation databases (`~/.gemini/antigravity-cli/conversations/*.db`).
 
 ACP lifecycle requests must include an existing absolute `cwd` and an empty `mcpServers` array. For example:
 
@@ -115,9 +107,11 @@ cargo test -- --include-ignored --skip test_e2e_
 
 GitHub Actions runs the formatting, Clippy, unit/I/O test, and release-build gates on Ubuntu and Windows. Authenticated E2E coverage remains a local/Paseo gate because it requires an `agy` installation and user authentication.
 
-## Debugging
+## ACP host compatibility
 
-To inspect the JSON-RPC messages between Zed and `agy-acp`, run `dev: open acp logs` from Zed's Command Palette.
+Paseo is the primary integration path for this repository. Other ACP hosts can launch the same stdio binary when they provide an existing absolute `cwd` and an empty `mcpServers` array.
+
+For Paseo debugging, capture the managed provider terminal and inspect the bounded invocation-log reference returned by the adapter. Do not write diagnostics to stdout: stdout is reserved for newline-delimited ACP JSON-RPC.
 
 ## License
 

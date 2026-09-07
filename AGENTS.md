@@ -1,6 +1,6 @@
 # agy-acp
 
-Single Rust crate. ACP (Agent Client Protocol) stdio adapter for Google Antigravity CLI (`agy`). Bridges `agy` into OpenAB's JSON-RPC protocol.
+Single Rust crate. ACP (Agent Client Protocol) stdio adapter for Google Antigravity CLI (`agy`). Bridges `agy` into Paseo's workspace-scoped ACP/JSON-RPC provider flow.
 
 ## Commands
 
