@@ -62,4 +62,6 @@ No separate lint/typecheck/format commands — just `cargo build` and `cargo tes
 - Both `session/set_model` and `session/setConfigOption` are accepted for model selection.
 - Runtime input and output are bounded: JSON-RPC frames (1 MiB), prompt text (256 KiB), `AGY_EXTRA_ARGS` (64 KiB), model discovery output (256 KiB), child stdout (4 MiB), SQLite step payloads (1 MiB), and SQLite rows per poll (256). Oversized data fails closed or advances the cursor without retaining the payload.
 - Persisted session state is bounded to 1 MiB and 1024 sessions; malformed, oversized, or invalid-cursor state fails closed before installation.
+- Persisted conversation IDs are bounded and reject control/path-separator characters; SQLite access still requires a parsed UUID before joining the conversation database path.
 - SQLite replay pages are bounded to 256 rows and 4 MiB per read, with an 8 MiB total replay budget. `session/load` paginates to the latest cursor; histories exceeding the budget return an explicit error instead of partial replay.
+- The resident cache uses a deterministic LRU-style eviction policy at 64 sessions and prefers evicting inactive sessions; retained failure logs are pruned to 64 files/16 MiB while active and current diagnostics are protected.

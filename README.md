@@ -101,6 +101,8 @@ Non-empty `mcpServers` lists are rejected because `agy-acp` does not currently f
 - Input and subprocess buffers are bounded: JSON-RPC frames are limited to 1 MiB, prompt text to 256 KiB, `AGY_EXTRA_ARGS` to 64 KiB, model discovery output to 256 KiB, child stdout to 4 MiB, and each SQLite step payload to 1 MiB. Oversized frames fail with an invalid-request response; oversized runtime data fails closed without unbounded allocation.
 - SQLite polling reads at most 256 steps and 4 MiB of payload per pass, and advances over oversized payloads, so a long conversation cannot force one poll to materialize its entire history. Session replay paginates across pages but fails closed above an 8 MiB history budget rather than returning a partial cursor. Invocation log scans use bounded prefix/tail windows.
 - Persisted `sessions.json` is capped at 1 MiB and 1024 sessions; oversized or malformed state is rejected before it can enter the in-memory session cache.
+- `AGY_EXTRA_ARGS` supports single/double quotes and backslash escapes without invoking a shell; malformed quoting fails closed. Resident sessions use deterministic LRU-style eviction at 64 entries and prefer inactive sessions.
+- Persisted conversation IDs reject control/path-separator characters before state installation; SQLite database access still requires a valid UUID. Retained failure logs are bounded to 64 files/16 MiB while active/current logs are protected.
 - Cancelling a prompt terminates the full child process tree on Windows and suppresses the helper command's output from the ACP stdout stream.
 
 ## Local Verification

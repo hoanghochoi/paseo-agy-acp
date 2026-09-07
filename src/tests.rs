@@ -41,6 +41,17 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::AsyncWrite;
 
+const TEST_CONVERSATION_A: &str = "00000000-0000-4000-8000-000000000101";
+const TEST_CONVERSATION_B: &str = "00000000-0000-4000-8000-000000000102";
+const TEST_CONVERSATION_AFTER_ERROR: &str = "00000000-0000-4000-8000-000000000103";
+const TEST_CONVERSATION_LATE: &str = "00000000-0000-4000-8000-000000000104";
+const TEST_CONVERSATION_ABC: &str = "00000000-0000-4000-8000-000000000105";
+const TEST_CONVERSATION_XYZ: &str = "00000000-0000-4000-8000-000000000106";
+const TEST_CONVERSATION_NR: &str = "00000000-0000-4000-8000-000000000107";
+const TEST_CONVERSATION_M1: &str = "00000000-0000-4000-8000-000000000108";
+const TEST_CONVERSATION_LOAD: &str = "00000000-0000-4000-8000-000000000109";
+const TEST_CONVERSATION_RESUME: &str = "00000000-0000-4000-8000-000000000110";
+
 #[test]
 fn oversized_protocol_line_is_rejected_without_forwarding_payload() {
     let oversized = format!("{}\n", "x".repeat(crate::MAX_INPUT_LINE_BYTES + 1));
@@ -139,6 +150,35 @@ fn model_output_parser_rejects_oversized_output() {
 fn extra_args_parser_rejects_oversized_environment_input() {
     let output = "--flag ".repeat(crate::adapter::MAX_EXTRA_ARGS_BYTES / 7 + 1);
     assert!(crate::adapter::parse_extra_args_bounded(&output).is_none());
+}
+
+#[test]
+fn extra_args_parser_supports_quotes_and_escaped_whitespace() {
+    let args = crate::adapter::parse_extra_args_bounded(
+        r#"--label "hello world" --path 'C:\Program Files\agy' escaped\ value """#,
+    )
+    .expect("quoted extra args should parse");
+    let args: Vec<_> = args
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args,
+        vec![
+            "--label",
+            "hello world",
+            "--path",
+            "C:\\Program Files\\agy",
+            "escaped value",
+            "",
+        ]
+    );
+}
+
+#[test]
+fn extra_args_parser_rejects_unterminated_quotes_and_escapes() {
+    assert!(crate::adapter::parse_extra_args_bounded("--flag \"unterminated").is_none());
+    assert!(crate::adapter::parse_extra_args_bounded("--flag trailing\\").is_none());
 }
 
 #[test]
@@ -251,6 +291,71 @@ fn persisted_state_session_count_is_bounded() {
 
     let error = adapter.load_store().unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn persisted_conversation_id_rejects_path_injection() {
+    let root = fresh_test_root("invalid-persisted-conversation");
+    let adapter = test_adapter(&root);
+    fs::create_dir_all(adapter.state_file.parent().unwrap()).unwrap();
+    fs::write(
+        &adapter.state_file,
+        serde_json::to_vec(&json!({
+            "sessions": {
+                "session": {
+                    "conversation_id": "..\\outside.db",
+                    "last_step_idx": -1,
+                    "model_id": null,
+                    "cwd": root.to_string_lossy(),
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = adapter.load_store().unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn resident_eviction_is_lru_and_prefers_inactive_sessions() {
+    let root = fresh_test_root("resident-lru");
+    let mut adapter = test_adapter(&root);
+    let mut session_ids = Vec::new();
+    for index in 0..crate::adapter::MAX_RESIDENT_SESSIONS {
+        let response = adapter.handle_session_new(json!(index), &session_setup_params(&root));
+        session_ids.push(
+            response.result.as_ref().unwrap()["sessionId"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    let first = session_ids[0].clone();
+    let second = session_ids[1].clone();
+    let third = session_ids[2].clone();
+    let response =
+        adapter.handle_session_resume(json!(100), &session_lifecycle_params(&first, &root));
+    assert!(response.error.is_none());
+    adapter.mark_prompt_active(&second);
+
+    let inserted = adapter.handle_session_new(json!(101), &session_setup_params(&root));
+    assert!(inserted.error.is_none());
+    assert!(adapter.sessions.contains_key(&first));
+    assert!(adapter.sessions.contains_key(&second));
+    assert!(!adapter.sessions.contains_key(&third));
+
+    let fourth = session_ids[3].clone();
+    let inserted = adapter.handle_session_new(json!(102), &session_setup_params(&root));
+    assert!(inserted.error.is_none());
+    assert!(adapter.sessions.contains_key(&second));
+    assert!(!adapter.sessions.contains_key(&fourth));
+    adapter.mark_prompt_complete(&second);
+
     let _ = fs::remove_dir_all(root);
 }
 
@@ -684,7 +789,7 @@ fn apply_prompt_outcome_keeps_partial_failed_turn_progress() {
     let session_id = open_test_session(&mut adapter, &cwd);
     let outcome = crate::runtime::PromptOutcome {
         session_id: session_id.clone(),
-        conversation_id: Some("conversation-after-error".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_AFTER_ERROR.to_string()),
         last_step_idx: 9,
         response: JsonRpcResponse::error(json!(8), -32000, "terminal check failed"),
         run_log_path: root.join("partial-outcome.log"),
@@ -698,7 +803,7 @@ fn apply_prompt_outcome_keeps_partial_failed_turn_progress() {
     let session = &adapter.sessions[&session_id];
     assert_eq!(
         session.conversation_id.as_deref(),
-        Some("conversation-after-error")
+        Some(TEST_CONVERSATION_AFTER_ERROR)
     );
     assert_eq!(session.last_step_idx, 9);
 }
@@ -710,7 +815,7 @@ fn apply_prompt_outcome_never_recreates_a_missing_session() {
     let mut adapter = test_adapter(&root);
     let outcome = crate::runtime::PromptOutcome {
         session_id: "removed-session".to_string(),
-        conversation_id: Some("late-conversation".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_LATE.to_string()),
         last_step_idx: 3,
         response: JsonRpcResponse::success(json!(9), json!({"stopReason": "end_turn"})),
         run_log_path: root.join("missing-outcome.log"),
@@ -748,7 +853,7 @@ fn outcome_persistence_failure_maps_terminal_error_and_retains_run_log() {
     let before = adapter.sessions["active-session"].clone();
     let outcome = crate::runtime::PromptOutcome {
         session_id: "active-session".to_string(),
-        conversation_id: Some("new-conversation".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_B.to_string()),
         last_step_idx: 12,
         response: JsonRpcResponse::success(json!(10), json!({"stopReason": "end_turn"})),
         run_log_path: run_log_path.clone(),
@@ -819,7 +924,7 @@ fn late_outcome_updates_evicted_persisted_session_without_reinserting_it() {
 
     let outcome = crate::runtime::PromptOutcome {
         session_id: victim.clone(),
-        conversation_id: Some("late-conversation".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_LATE.to_string()),
         last_step_idx: 42,
         response: JsonRpcResponse::success(json!(12), json!({"stopReason": "end_turn"})),
         run_log_path: run_log_path.clone(),
@@ -832,7 +937,10 @@ fn late_outcome_updates_evicted_persisted_session_without_reinserting_it() {
         .restore_session(victim)
         .expect("updated victim state should be readable")
         .expect("updated victim should remain persisted");
-    assert_eq!(after.conversation_id.as_deref(), Some("late-conversation"));
+    assert_eq!(
+        after.conversation_id.as_deref(),
+        Some(TEST_CONVERSATION_LATE)
+    );
     assert_eq!(after.last_step_idx, 42);
     assert_eq!(after.cwd, before.cwd);
     assert_eq!(after.model_id, before.model_id);
@@ -847,7 +955,7 @@ fn resident_conversation_conflict_fails_without_mutation_and_retains_run_log() {
     let mut adapter = test_adapter(&root);
     let session_id = "resident-conflict";
     let session = crate::types::Session {
-        conversation_id: Some("conversation-a".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_A.to_string()),
         last_step_idx: 11,
         model_id: Some("preserved-model".to_string()),
         cwd: root.clone(),
@@ -866,7 +974,7 @@ fn resident_conversation_conflict_fails_without_mutation_and_retains_run_log() {
     fs::write(&run_log_path, b"resident conflict diagnostic").unwrap();
     let outcome = crate::runtime::PromptOutcome {
         session_id: session_id.to_string(),
-        conversation_id: Some("conversation-b".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_B.to_string()),
         last_step_idx: 99,
         response: JsonRpcResponse::success(json!(13), json!({"stopReason": "end_turn"})),
         run_log_path: run_log_path.clone(),
@@ -894,7 +1002,7 @@ fn evicted_conversation_conflict_fails_without_mutation_and_retains_run_log() {
     let mut adapter = test_adapter(&root);
     let session_id = "evicted-conflict";
     let session = crate::types::Session {
-        conversation_id: Some("conversation-a".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_A.to_string()),
         last_step_idx: 21,
         model_id: Some("preserved-model".to_string()),
         cwd: root.clone(),
@@ -910,7 +1018,7 @@ fn evicted_conversation_conflict_fails_without_mutation_and_retains_run_log() {
     fs::write(&run_log_path, b"evicted conflict diagnostic").unwrap();
     let outcome = crate::runtime::PromptOutcome {
         session_id: session_id.to_string(),
-        conversation_id: Some("conversation-b".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_B.to_string()),
         last_step_idx: 100,
         response: JsonRpcResponse::success(json!(14), json!({"stopReason": "end_turn"})),
         run_log_path: run_log_path.clone(),
@@ -938,7 +1046,7 @@ fn resident_matching_outcome_rejects_conflicting_persisted_binding() {
     let mut adapter = test_adapter(&root);
     let session_id = "persisted-conflict";
     let persisted = crate::types::Session {
-        conversation_id: Some("conversation-a".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_A.to_string()),
         last_step_idx: 30,
         model_id: Some("persisted-model".to_string()),
         cwd: root.clone(),
@@ -947,7 +1055,7 @@ fn resident_matching_outcome_rejects_conflicting_persisted_binding() {
         .persist_session(session_id, &persisted)
         .expect("persisted conflict fixture should persist");
     let resident = crate::types::Session {
-        conversation_id: Some("conversation-b".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_B.to_string()),
         last_step_idx: 31,
         model_id: Some("resident-model".to_string()),
         cwd: root.clone(),
@@ -963,7 +1071,7 @@ fn resident_matching_outcome_rejects_conflicting_persisted_binding() {
     fs::write(&run_log_path, b"persisted conflict diagnostic").unwrap();
     let outcome = crate::runtime::PromptOutcome {
         session_id: session_id.to_string(),
-        conversation_id: Some("conversation-b".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_B.to_string()),
         last_step_idx: 32,
         response: JsonRpcResponse::success(json!(17), json!({"stopReason": "end_turn"})),
         run_log_path: run_log_path.clone(),
@@ -991,7 +1099,7 @@ fn prompt_outcome_cursor_is_monotonic_for_resident_and_evicted_sessions() {
     let mut adapter = test_adapter(&root);
     let resident_id = "resident-monotonic";
     let resident = crate::types::Session {
-        conversation_id: Some("conversation-b".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_B.to_string()),
         last_step_idx: 10,
         model_id: None,
         cwd: root.clone(),
@@ -1002,7 +1110,7 @@ fn prompt_outcome_cursor_is_monotonic_for_resident_and_evicted_sessions() {
     adapter.sessions.insert(resident_id.to_string(), resident);
     let resident_outcome = crate::runtime::PromptOutcome {
         session_id: resident_id.to_string(),
-        conversation_id: Some("conversation-b".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_B.to_string()),
         last_step_idx: 6,
         response: JsonRpcResponse::success(json!(15), json!({"stopReason": "end_turn"})),
         run_log_path: root.join("resident-monotonic.log"),
@@ -1024,7 +1132,7 @@ fn prompt_outcome_cursor_is_monotonic_for_resident_and_evicted_sessions() {
 
     let evicted_id = "evicted-monotonic";
     let evicted = crate::types::Session {
-        conversation_id: Some("conversation-b".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_B.to_string()),
         last_step_idx: 20,
         model_id: None,
         cwd: root.clone(),
@@ -1034,7 +1142,7 @@ fn prompt_outcome_cursor_is_monotonic_for_resident_and_evicted_sessions() {
         .expect("evicted monotonic fixture should persist");
     let evicted_outcome = crate::runtime::PromptOutcome {
         session_id: evicted_id.to_string(),
-        conversation_id: Some("conversation-b".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_B.to_string()),
         last_step_idx: 25,
         response: JsonRpcResponse::success(json!(16), json!({"stopReason": "end_turn"})),
         run_log_path: root.join("evicted-monotonic.log"),
@@ -1062,7 +1170,7 @@ fn outcome_without_conversation_preserves_resident_and_evicted_bindings() {
     let mut adapter = test_adapter(&root);
     let resident_id = "resident-without-outcome-binding";
     let resident = crate::types::Session {
-        conversation_id: Some("conversation-a".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_A.to_string()),
         last_step_idx: 40,
         model_id: None,
         cwd: root.clone(),
@@ -1098,7 +1206,7 @@ fn outcome_without_conversation_preserves_resident_and_evicted_bindings() {
 
     let evicted_id = "evicted-without-outcome-binding";
     let evicted = crate::types::Session {
-        conversation_id: Some("conversation-a".to_string()),
+        conversation_id: Some(TEST_CONVERSATION_A.to_string()),
         last_step_idx: 50,
         model_id: None,
         cwd: root.clone(),
@@ -1124,7 +1232,7 @@ fn outcome_without_conversation_preserves_resident_and_evicted_bindings() {
         .restore_session(evicted_id)
         .expect("evicted no-binding state should be readable")
         .expect("evicted no-binding row should exist");
-    assert_eq!(stored.conversation_id.as_deref(), Some("conversation-a"));
+    assert_eq!(stored.conversation_id.as_deref(), Some(TEST_CONVERSATION_A));
     assert_eq!(stored.last_step_idx, 50);
 }
 
@@ -1727,6 +1835,37 @@ fn retained_run_log_message_uses_only_a_bounded_bridge_reference() {
     assert!(fallback.ends_with("run-logs/unavailable.log"));
 }
 
+#[test]
+fn retained_run_logs_are_bounded_without_deleting_active_or_current() {
+    let root = fresh_test_root("run-log-retention");
+    let run_logs_dir = root.join("run-logs");
+    fs::create_dir_all(&run_logs_dir).unwrap();
+    let active_path = run_logs_dir.join(format!("{}.log", Uuid::new_v4()));
+    let current_path = run_logs_dir.join(format!("{}.log", Uuid::new_v4()));
+    fs::write(&active_path, b"active").unwrap();
+    fs::write(&current_path, b"current").unwrap();
+    crate::runtime::register_active_run_log(&active_path);
+
+    for _ in 0..(crate::runtime::MAX_RETAINED_RUN_LOGS + 3) {
+        let path = run_logs_dir.join(format!("{}.log", Uuid::new_v4()));
+        fs::write(path, b"retained diagnostic").unwrap();
+    }
+
+    crate::runtime::prune_retained_run_logs(&run_logs_dir, Some(&current_path));
+    crate::runtime::unregister_active_run_log(&active_path);
+
+    assert!(active_path.exists());
+    assert!(current_path.exists());
+    let candidate_count = fs::read_dir(&run_logs_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path() != active_path && entry.path() != current_path)
+        .count();
+    assert!(candidate_count <= crate::runtime::MAX_RETAINED_RUN_LOGS);
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn failed_process_stderr_and_prompt_never_reach_protocol_output() {
     // Break caught: child stderr or the submitted prompt being reflected into ACP output.
@@ -1776,6 +1915,9 @@ fn test_adapter(root: &std::path::Path) -> Adapter {
         available_models: vec!["fake-model\tFake Model".to_string()],
         skip_naration: false,
         command: CommandSpec::new("agy", Vec::new()),
+        session_access: HashMap::new(),
+        next_access: 0,
+        active_sessions: std::collections::HashSet::new(),
     }
 }
 
@@ -1935,7 +2077,7 @@ fn session_set_model_persistence_failure_preserves_memory_and_corrupt_store() {
     adapter.sessions.insert(
         "model-session".to_string(),
         crate::types::Session {
-            conversation_id: Some("conversation-model".to_string()),
+            conversation_id: Some(TEST_CONVERSATION_B.to_string()),
             last_step_idx: 4,
             model_id: Some("old-model".to_string()),
             cwd: root.clone(),
@@ -3333,7 +3475,7 @@ fn test_session_load_restores_persisted_session() {
         .persist_session(
             "sess-1",
             &crate::types::Session {
-                conversation_id: Some("conv-abc".to_string()),
+                conversation_id: Some(TEST_CONVERSATION_ABC.to_string()),
                 last_step_idx: 5,
                 model_id: None,
                 cwd: root.clone(),
@@ -3352,7 +3494,7 @@ fn test_session_load_restores_persisted_session() {
             .sessions
             .get("sess-1")
             .and_then(|s| s.conversation_id.as_deref()),
-        Some("conv-abc")
+        Some(TEST_CONVERSATION_ABC)
     );
     assert_eq!(
         adapter.sessions.get("sess-1").map(|s| s.last_step_idx),
@@ -3629,7 +3771,7 @@ fn test_session_resume_restores_persisted_session() {
         .persist_session(
             "sess-r1",
             &crate::types::Session {
-                conversation_id: Some("conv-xyz".to_string()),
+                conversation_id: Some(TEST_CONVERSATION_XYZ.to_string()),
                 last_step_idx: 3,
                 model_id: None,
                 cwd: root.clone(),
@@ -3655,7 +3797,7 @@ fn test_session_resume_restores_persisted_session() {
             .sessions
             .get("sess-r1")
             .and_then(|s| s.conversation_id.as_deref()),
-        Some("conv-xyz")
+        Some(TEST_CONVERSATION_XYZ)
     );
     assert_eq!(
         adapter.sessions.get("sess-r1").map(|s| s.last_step_idx),
@@ -3771,7 +3913,7 @@ fn test_session_resume_does_not_replay_history() {
         .persist_session(
             "sess-nr",
             &crate::types::Session {
-                conversation_id: Some("conv-nr".to_string()),
+                conversation_id: Some(TEST_CONVERSATION_NR.to_string()),
                 last_step_idx: 10,
                 model_id: None,
                 cwd: root.clone(),
@@ -3887,7 +4029,7 @@ fn test_persist_and_restore_session() {
         .persist_session(
             "sess-1",
             &crate::types::Session {
-                conversation_id: Some("conv-abc".to_string()),
+                conversation_id: Some(TEST_CONVERSATION_ABC.to_string()),
                 last_step_idx: 7,
                 model_id: None,
                 cwd: root.clone(),
@@ -3900,7 +4042,7 @@ fn test_persist_and_restore_session() {
     assert_eq!(
         restored,
         Some(crate::types::StoredSession {
-            conversation_id: Some("conv-abc".to_string()),
+            conversation_id: Some(TEST_CONVERSATION_ABC.to_string()),
             last_step_idx: 7,
             model_id: None,
             cwd: Some(root.to_string_lossy().to_string()),
@@ -4817,7 +4959,7 @@ fn test_session_set_model_persists() {
         .persist_session(
             "sess-m1",
             &crate::types::Session {
-                conversation_id: Some("conv-m1".to_string()),
+                conversation_id: Some(TEST_CONVERSATION_M1.to_string()),
                 last_step_idx: 0,
                 model_id: None,
                 cwd: root.clone(),
@@ -4840,7 +4982,7 @@ fn test_session_set_model_persists() {
     assert_eq!(
         restored,
         Some(crate::types::StoredSession {
-            conversation_id: Some("conv-m1".to_string()),
+            conversation_id: Some(TEST_CONVERSATION_M1.to_string()),
             last_step_idx: 0,
             model_id: Some("Claude Opus 4.6 (Thinking)".to_string()),
             cwd: Some(root.to_string_lossy().to_string()),
@@ -4867,7 +5009,7 @@ fn test_session_load_returns_models() {
         .persist_session(
             "test-load",
             &crate::types::Session {
-                conversation_id: Some("conv-load".to_string()),
+                conversation_id: Some(TEST_CONVERSATION_LOAD.to_string()),
                 last_step_idx: -1,
                 model_id: Some("Gemini 3.1 Pro (High)".to_string()),
                 cwd: root.clone(),
@@ -4905,7 +5047,7 @@ fn test_session_resume_returns_models() {
         .persist_session(
             "test-resume",
             &crate::types::Session {
-                conversation_id: Some("conv-resume".to_string()),
+                conversation_id: Some(TEST_CONVERSATION_RESUME.to_string()),
                 last_step_idx: -1,
                 model_id: Some("GPT-OSS 120B (Medium)".to_string()),
                 cwd: root.clone(),

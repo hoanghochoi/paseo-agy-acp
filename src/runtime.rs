@@ -6,9 +6,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -28,6 +28,69 @@ pub(crate) const MAX_CHILD_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CHILD_STDOUT_DRAIN_TIME: Duration = Duration::from_secs(2);
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const MAX_RETAINED_RUN_LOGS: usize = 64;
+pub(crate) const MAX_RETAINED_RUN_LOG_BYTES: u64 = 16 * 1024 * 1024;
+
+static ACTIVE_RUN_LOGS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn active_run_logs() -> &'static Mutex<HashSet<PathBuf>> {
+    ACTIVE_RUN_LOGS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(crate) fn register_active_run_log(path: &Path) {
+    active_run_logs().lock().unwrap().insert(path.to_path_buf());
+}
+
+pub(crate) fn unregister_active_run_log(path: &Path) {
+    active_run_logs().lock().unwrap().remove(path);
+}
+
+pub(crate) fn prune_retained_run_logs(run_logs_dir: &Path, keep: Option<&Path>) {
+    let active = active_run_logs().lock().unwrap();
+    let mut files = Vec::new();
+    let Ok(entries) = fs::read_dir(run_logs_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("log")
+            || active.contains(&path)
+            || keep.is_some_and(|keep| keep == path)
+        {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if Uuid::parse_str(stem).is_err() {
+            continue;
+        }
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        files.push((
+            path,
+            metadata.len(),
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        ));
+    }
+
+    files.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
+
+    let mut retained_bytes = 0u64;
+    for (index, (path, size, _)) in files.into_iter().enumerate() {
+        let within_count = index < MAX_RETAINED_RUN_LOGS;
+        let within_bytes = retained_bytes.saturating_add(size) <= MAX_RETAINED_RUN_LOG_BYTES;
+        // Always retain the newest file even when one individual diagnostic is
+        // larger than the aggregate byte budget; older files remain bounded.
+        if within_count && (within_bytes || index == 0) {
+            retained_bytes = retained_bytes.saturating_add(size);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct LimitedChildOutput {
@@ -241,11 +304,26 @@ pub(crate) fn finalize_prompt_outcome(
     outcome: PromptOutcome,
 ) -> JsonRpcResponse {
     let response_id = outcome.response.id.clone();
+    let run_log_path = outcome.run_log_path.clone();
+    let run_logs_dir = run_log_path.parent().map(Path::to_path_buf);
     if adapter.apply_prompt_outcome(&outcome).is_err() {
+        unregister_active_run_log(&run_log_path);
+        if let Some(run_logs_dir) = run_logs_dir.as_deref() {
+            prune_retained_run_logs(run_logs_dir, Some(&run_log_path));
+        }
         return JsonRpcResponse::error(response_id, -32603, "failed to persist session state");
     }
     if outcome.remove_run_log_on_commit {
-        let _ = fs::remove_file(&outcome.run_log_path);
+        let _ = fs::remove_file(&run_log_path);
+    }
+    unregister_active_run_log(&run_log_path);
+    if let Some(run_logs_dir) = run_logs_dir.as_deref() {
+        let keep = outcome
+            .response
+            .error
+            .as_ref()
+            .map(|_| run_log_path.as_path());
+        prune_retained_run_logs(run_logs_dir, keep);
     }
     outcome.response
 }
@@ -270,6 +348,7 @@ pub(crate) async fn execute_prompt(
     } = execution;
     let run_logs_dir = state_dir.join("run-logs");
     let run_log_path = run_logs_dir.join(format!("{}.log", Uuid::new_v4()));
+    register_active_run_log(&run_log_path);
 
     let mut args: Vec<OsString> = vec![
         "--add-dir".into(),
@@ -287,7 +366,11 @@ pub(crate) async fn execute_prompt(
                 session_id,
                 conversation_id,
                 last_step_idx: initial_step_idx,
-                response: JsonRpcResponse::error(id, -32602, "AGY_EXTRA_ARGS exceeds maximum size"),
+                response: JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "AGY_EXTRA_ARGS is invalid or exceeds maximum size",
+                ),
                 run_log_path,
                 remove_run_log_on_commit: false,
             };
@@ -693,12 +776,16 @@ async fn dispatch_request(
                             .await;
                         }
                         Ok(registration) => {
+                            {
+                                let mut adapter = adapter.lock().await;
+                                adapter.mark_prompt_active(&session_id);
+                            }
                             let cancelled = registration.cancellation_flag();
                             let task_adapter = Arc::clone(adapter);
                             let task_output = output.clone();
                             let completion = PromptCompletion::new(
                                 active.clone(),
-                                session_id,
+                                session_id.clone(),
                                 registration,
                                 done.clone(),
                             );
@@ -708,7 +795,9 @@ async fn dispatch_request(
                                     execute_prompt(execution, cancelled, task_output.clone()).await;
                                 let response = {
                                     let mut adapter = task_adapter.lock().await;
-                                    finalize_prompt_outcome(&mut adapter, outcome)
+                                    let response = finalize_prompt_outcome(&mut adapter, outcome);
+                                    adapter.mark_prompt_complete(&session_id);
+                                    response
                                 };
                                 let _ = output::send_response(&task_output, response).await;
                             });

@@ -1,6 +1,6 @@
 use fs2::FileExt;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -22,6 +22,7 @@ pub(crate) const MAX_MODEL_OUTPUT_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_EXTRA_ARGS_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_PERSISTED_STATE_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_PERSISTED_SESSIONS: usize = 1024;
+pub(crate) const MAX_RESIDENT_SESSIONS: usize = 64;
 const MAX_PERSISTED_SESSION_ID_BYTES: usize = 256;
 const MAX_PERSISTED_CONVERSATION_ID_BYTES: usize = 128;
 const MAX_PERSISTED_MODEL_ID_BYTES: usize = 256;
@@ -156,12 +157,62 @@ pub(crate) fn parse_extra_args_bounded(extra: &str) -> Option<Vec<std::ffi::OsSt
     if extra.len() > MAX_EXTRA_ARGS_BYTES {
         return None;
     }
-    Some(
-        extra
-            .split_whitespace()
-            .map(std::ffi::OsString::from)
-            .collect(),
-    )
+
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut token_started = false;
+
+    for character in extra.chars() {
+        if escaped {
+            current.push(character);
+            token_started = true;
+            escaped = false;
+            continue;
+        }
+
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                } else {
+                    current.push(character);
+                }
+            }
+            Some('"') => match character {
+                '"' => quote = None,
+                '\\' => escaped = true,
+                _ => current.push(character),
+            },
+            Some(_) => unreachable!("extra-argument parser only uses quote delimiters"),
+            None => match character {
+                '\\' => escaped = true,
+                '\'' | '"' => {
+                    quote = Some(character);
+                    token_started = true;
+                }
+                character if character.is_whitespace() => {
+                    if token_started {
+                        args.push(std::ffi::OsString::from(std::mem::take(&mut current)));
+                        token_started = false;
+                    }
+                }
+                _ => {
+                    current.push(character);
+                    token_started = true;
+                }
+            },
+        }
+    }
+
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if token_started {
+        args.push(std::ffi::OsString::from(current));
+    }
+    Some(args)
 }
 
 fn read_file_bounded(path: &std::path::Path, max_bytes: usize) -> Option<Vec<u8>> {
@@ -199,14 +250,19 @@ fn validate_store_bounds(store: &SessionStore) -> io::Result<()> {
         if session_id.is_empty() || session_id.len() > MAX_PERSISTED_SESSION_ID_BYTES {
             return Err(invalid_state("persisted session ID exceeds maximum size"));
         }
-        if session
-            .conversation_id
-            .as_deref()
-            .is_some_and(|value| value.len() > MAX_PERSISTED_CONVERSATION_ID_BYTES)
-        {
-            return Err(invalid_state(
-                "persisted conversation ID exceeds maximum size",
-            ));
+        if let Some(conversation_id) = session.conversation_id.as_deref() {
+            if conversation_id.len() > MAX_PERSISTED_CONVERSATION_ID_BYTES {
+                return Err(invalid_state(
+                    "persisted conversation ID exceeds maximum size",
+                ));
+            }
+            if conversation_id.trim().is_empty()
+                || conversation_id
+                    .chars()
+                    .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+            {
+                return Err(invalid_state("persisted conversation ID is unsafe"));
+            }
         }
         if session
             .model_id
@@ -236,6 +292,9 @@ pub struct Adapter {
     pub available_models: Vec<String>,
     pub skip_naration: bool,
     pub(crate) command: CommandSpec,
+    pub(crate) session_access: HashMap<String, u64>,
+    pub(crate) next_access: u64,
+    pub(crate) active_sessions: HashSet<String>,
 }
 
 impl Adapter {
@@ -257,6 +316,9 @@ impl Adapter {
             available_models: Self::fetch_available_models(),
             skip_naration,
             command: CommandSpec::new("agy", Vec::new()),
+            session_access: HashMap::new(),
+            next_access: 0,
+            active_sessions: HashSet::new(),
         }
     }
 
@@ -507,22 +569,50 @@ impl Adapter {
         })
     }
 
+    fn touch_session(&mut self, session_id: &str) {
+        self.next_access = self.next_access.saturating_add(1);
+        self.session_access
+            .insert(session_id.to_string(), self.next_access);
+    }
+
+    pub(crate) fn mark_prompt_active(&mut self, session_id: &str) {
+        self.active_sessions.insert(session_id.to_string());
+    }
+
+    pub(crate) fn mark_prompt_complete(&mut self, session_id: &str) {
+        self.active_sessions.remove(session_id);
+    }
+
     fn evict_if_needed(&mut self) {
-        const MAX_SESSIONS: usize = 64;
-        while self.sessions.len() >= MAX_SESSIONS {
-            if let Some(key) = self.sessions.keys().next().cloned() {
-                self.sessions.remove(&key);
-            }
+        while self.sessions.len() >= MAX_RESIDENT_SESSIONS {
+            let inactive_victim = self
+                .sessions
+                .keys()
+                .filter(|key| !self.active_sessions.contains(*key))
+                .min_by_key(|key| self.session_access.get(*key).copied().unwrap_or(0))
+                .cloned();
+            let victim = inactive_victim.or_else(|| {
+                self.sessions
+                    .keys()
+                    .min_by_key(|key| self.session_access.get(*key).copied().unwrap_or(0))
+                    .cloned()
+            });
+            let Some(victim) = victim else {
+                break;
+            };
+            self.sessions.remove(&victim);
+            self.session_access.remove(&victim);
         }
     }
 
     fn candidate_session(
-        &self,
+        &mut self,
         session_id: &str,
         cwd_override: Option<PathBuf>,
     ) -> io::Result<Option<Session>> {
         if let Some(session) = self.sessions.get(session_id) {
             let mut candidate = session.clone();
+            self.touch_session(session_id);
             if let Some(cwd) = cwd_override {
                 candidate.cwd = cwd;
             }
@@ -543,6 +633,7 @@ impl Adapter {
             self.evict_if_needed();
         }
         self.sessions.insert(session_id.to_string(), candidate);
+        self.touch_session(session_id);
     }
 
     pub fn restore_session_state(
