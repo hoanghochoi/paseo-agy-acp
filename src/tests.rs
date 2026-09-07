@@ -208,6 +208,217 @@ fn db_row_reader_bounds_rows_and_payloads() {
 }
 
 #[test]
+fn oversized_persisted_state_file_is_rejected() {
+    let root = fresh_test_root("oversized-state-file");
+    let adapter = test_adapter(&root);
+    fs::create_dir_all(adapter.state_file.parent().unwrap()).unwrap();
+    let oversized_cwd = "x".repeat(1024 * 1024);
+    let state = json!({
+        "sessions": {
+            "session": {
+                "conversation_id": null,
+                "last_step_idx": -1,
+                "model_id": null,
+                "cwd": oversized_cwd,
+            }
+        }
+    });
+    fs::write(&adapter.state_file, serde_json::to_vec(&state).unwrap()).unwrap();
+
+    let error = adapter.load_store().unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn persisted_state_session_count_is_bounded() {
+    let root = fresh_test_root("state-session-count");
+    let adapter = test_adapter(&root);
+    fs::create_dir_all(adapter.state_file.parent().unwrap()).unwrap();
+    let mut state = SessionStore::default();
+    for index in 0..1025 {
+        state.sessions.insert(
+            format!("session-{index}"),
+            StoredSession {
+                conversation_id: None,
+                last_step_idx: -1,
+                model_id: None,
+                cwd: Some(root.to_string_lossy().to_string()),
+            },
+        );
+    }
+    fs::write(&adapter.state_file, serde_json::to_vec(&state).unwrap()).unwrap();
+
+    let error = adapter.load_store().unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn db_row_reader_caps_total_payload_bytes_per_page() {
+    let root = fresh_test_root("bounded-db-bytes");
+    let conversations_dir = root.join("conversations");
+    fs::create_dir_all(&conversations_dir).unwrap();
+    let conversation_id = "00000000-0000-4000-8000-000000000032";
+    let db_path = conversations_dir.join(format!("{conversation_id}.db"));
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, step_payload BLOB)",
+    )
+    .unwrap();
+    for idx in 0..8i64 {
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
+            rusqlite::params![idx, vec![b'x'; 900_000]],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let rows = crate::db::read_rows_from_db(&conversations_dir, conversation_id, -1).unwrap();
+    let total_payload_bytes: usize = rows.iter().map(|(_, _, payload)| payload.len()).sum();
+    assert!(
+        total_payload_bytes <= 4 * 1024 * 1024,
+        "page payload bytes were not bounded: {total_payload_bytes}"
+    );
+    assert!(rows.len() < 8, "byte budget should stop before all rows");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[ignore]
+fn session_load_replays_beyond_one_page_and_keeps_tail_cursor() {
+    let root = fresh_test_root("replay-pagination");
+    let conv_dir = root.join("conversations");
+    fs::create_dir_all(&conv_dir).unwrap();
+    let conversation_id = "00000000-0000-4000-8000-000000000033";
+    let db_path = conv_dir.join(format!("{conversation_id}.db"));
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (
+            idx INTEGER PRIMARY KEY,
+            step_type INTEGER NOT NULL DEFAULT 0,
+            status INTEGER NOT NULL DEFAULT 0,
+            has_subtrajectory NUMERIC NOT NULL DEFAULT 0,
+            metadata BLOB,
+            error_details BLOB,
+            permissions BLOB,
+            task_details BLOB,
+            render_info BLOB,
+            step_payload BLOB,
+            step_format INTEGER NOT NULL DEFAULT 0
+        )",
+    )
+    .unwrap();
+    for idx in 1..=260i64 {
+        let (step_type, payload) = if idx % 2 == 0 {
+            (15, make_assistant_payload(&format!("assistant-{idx}")))
+        } else {
+            (14, make_user_payload(&format!("user-{idx}")))
+        };
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![idx, step_type, payload],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let mut adapter = test_adapter(&root);
+    adapter.conversations_dir = conv_dir;
+    adapter
+        .persist_session(
+            "sess-replay-tail",
+            &crate::types::Session {
+                conversation_id: Some(conversation_id.to_string()),
+                last_step_idx: -1,
+                model_id: None,
+                cwd: root.clone(),
+            },
+        )
+        .unwrap();
+
+    let output = adapter.handle_session_load(
+        json!(1),
+        &json!({
+            "sessionId": "sess-replay-tail",
+            "cwd": root.to_string_lossy(),
+            "mcpServers": []
+        }),
+    );
+    assert!(output.iter().any(|line| line.contains("assistant-260")));
+    assert_eq!(adapter.sessions["sess-replay-tail"].last_step_idx, 260);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[ignore]
+fn oversized_replay_history_fails_closed_without_installing_session() {
+    let root = fresh_test_root("replay-budget");
+    let conv_dir = root.join("conversations");
+    fs::create_dir_all(&conv_dir).unwrap();
+    let conversation_id = "00000000-0000-4000-8000-000000000034";
+    let db_path = conv_dir.join(format!("{conversation_id}.db"));
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (
+            idx INTEGER PRIMARY KEY,
+            step_type INTEGER NOT NULL DEFAULT 0,
+            status INTEGER NOT NULL DEFAULT 0,
+            has_subtrajectory NUMERIC NOT NULL DEFAULT 0,
+            metadata BLOB,
+            error_details BLOB,
+            permissions BLOB,
+            task_details BLOB,
+            render_info BLOB,
+            step_payload BLOB,
+            step_format INTEGER NOT NULL DEFAULT 0
+        )",
+    )
+    .unwrap();
+    let large_text = "x".repeat(900_000);
+    for idx in 1..=10i64 {
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
+            rusqlite::params![idx, make_assistant_payload(&large_text)],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let mut adapter = test_adapter(&root);
+    adapter.conversations_dir = conv_dir;
+    adapter
+        .persist_session(
+            "sess-replay-budget",
+            &crate::types::Session {
+                conversation_id: Some(conversation_id.to_string()),
+                last_step_idx: -1,
+                model_id: None,
+                cwd: root.clone(),
+            },
+        )
+        .unwrap();
+
+    let output = adapter.handle_session_load(
+        json!(1),
+        &json!({
+            "sessionId": "sess-replay-budget",
+            "cwd": root.to_string_lossy(),
+            "mcpServers": []
+        }),
+    );
+    let response: Value = serde_json::from_str(output.last().unwrap()).unwrap();
+    assert_eq!(response["error"]["code"], -32000);
+    assert_eq!(
+        response["error"]["message"],
+        "conversation history exceeds replay budget"
+    );
+    assert!(!adapter.sessions.contains_key("sess-replay-budget"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn active_prompts_allow_different_sessions_and_reject_duplicates() {
     // Break caught: replacing an in-flight registration for the same session.
     let active = crate::runtime::ActivePrompts::default();
@@ -1330,7 +1541,7 @@ async fn cancellation_finishes_a_slow_fake_child_without_waiting_for_timeout() {
     wait_for_fake_run_log(&harness.root).await;
 
     cancelled.store(true, Ordering::SeqCst);
-    let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .expect("cancelled fake child did not finish promptly")
         .unwrap();

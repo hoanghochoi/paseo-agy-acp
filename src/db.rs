@@ -15,10 +15,22 @@ use crate::protobuf::{
 /// Bound one SQLite read so a long-running turn cannot materialize an
 /// unbounded tail of history in one poll.
 pub(crate) const MAX_DB_ROWS_PER_READ: usize = 256;
+/// Bound the total payload materialized by one SQLite page in addition to the
+/// row count bound. A single page must not turn 256 individually-valid rows
+/// into an unbounded aggregate allocation.
+pub(crate) const MAX_DB_BYTES_PER_READ: usize = 4 * 1024 * 1024;
 /// Oversized step payloads are represented as empty payloads and still advance
 /// the cursor, preventing repeated allocation and retry of malformed data.
 pub(crate) const MAX_STEP_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_INVOCATION_LOG_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_REPLAY_INPUT_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_REPLAY_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayReadError {
+    Unavailable,
+    BudgetExceeded,
+}
 
 fn read_log_prefix(path: &Path) -> Option<Vec<u8>> {
     let file = fs::File::open(path).ok()?;
@@ -167,21 +179,30 @@ pub fn read_rows_from_db(
              FROM steps WHERE idx > ?1 ORDER BY idx LIMIT ?3",
         )
         .ok()?;
-    let rows: Vec<(i64, i64, Vec<u8>)> = stmt
-        .query_map(
-            rusqlite::params![
-                after_step_idx,
-                MAX_STEP_PAYLOAD_BYTES as i64,
-                MAX_DB_ROWS_PER_READ as i64
-            ],
-            |row| {
-                let payload = row.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default();
-                Ok((row.get(0)?, row.get(1)?, payload))
-            },
-        )
-        .ok()?
-        .filter_map(|r| r.ok())
-        .collect();
+    let mut rows = stmt
+        .query(rusqlite::params![
+            after_step_idx,
+            MAX_STEP_PAYLOAD_BYTES as i64,
+            MAX_DB_ROWS_PER_READ as i64
+        ])
+        .ok()?;
+    let mut collected = Vec::new();
+    let mut payload_bytes = 0usize;
+    while let Some(row) = rows.next().ok()? {
+        let idx = row.get(0).ok()?;
+        let step_type = row.get(1).ok()?;
+        let payload = row.get::<_, Option<Vec<u8>>>(2).ok()?.unwrap_or_default();
+        let next_payload_bytes = payload_bytes.saturating_add(payload.len());
+        if !collected.is_empty() && next_payload_bytes > MAX_DB_BYTES_PER_READ {
+            break;
+        }
+        payload_bytes = next_payload_bytes;
+        collected.push((idx, step_type, payload));
+        if collected.len() >= MAX_DB_ROWS_PER_READ {
+            break;
+        }
+    }
+    let rows = collected;
     Some(rows)
 }
 
@@ -189,54 +210,175 @@ pub fn read_replay_updates_from_db(
     conversations_dir: &Path,
     conversation_id: &str,
     skip_naration: bool,
-) -> Option<(Vec<Value>, i64)> {
-    let rows = read_rows_from_db(conversations_dir, conversation_id, -1)?;
+) -> Result<Option<(Vec<Value>, i64)>, ReplayReadError> {
     let mut max_idx = -1;
     let mut updates = Vec::new();
     let mut pending_agent_parts = Vec::new();
     let mut pending_thought_parts = Vec::new();
+    let mut after_step_idx = -1;
+    let mut input_bytes = 0usize;
+    let mut output_bytes = 0usize;
+    let mut saw_rows = false;
 
-    for (idx, step_type, payload) in &rows {
-        max_idx = max_idx.max(*idx);
-        if *step_type == 14 {
-            flush_agent_message(&mut pending_agent_parts, &mut updates, skip_naration);
-            flush_thought_message(&mut pending_thought_parts, &mut updates);
-            if let Some(text) = extract_user_text_from_step_payload(payload) {
-                updates.push(message_chunk_update("user_message_chunk", text));
+    loop {
+        let rows = read_rows_from_db(conversations_dir, conversation_id, after_step_idx)
+            .ok_or(ReplayReadError::Unavailable)?;
+        if rows.is_empty() {
+            break;
+        }
+        saw_rows = true;
+
+        for (idx, step_type, payload) in &rows {
+            input_bytes = input_bytes.saturating_add(payload.len());
+            if input_bytes > MAX_REPLAY_INPUT_BYTES {
+                return Err(ReplayReadError::BudgetExceeded);
             }
-        } else if *step_type == 15 {
-            if let Some(text) = extract_text_from_step_payload(payload) {
-                if !text.is_empty() {
-                    pending_agent_parts.push(text);
+            max_idx = max_idx.max(*idx);
+            if *step_type == 14 {
+                flush_agent_message(
+                    &mut pending_agent_parts,
+                    &mut updates,
+                    &mut output_bytes,
+                    skip_naration,
+                )?;
+                flush_thought_message(&mut pending_thought_parts, &mut updates, &mut output_bytes)?;
+                if let Some(text) = extract_user_text_from_step_payload(payload) {
+                    push_replay_update(
+                        &mut updates,
+                        &mut output_bytes,
+                        message_chunk_update("user_message_chunk", text),
+                    )?;
+                }
+            } else if *step_type == 15 {
+                if let Some(text) = extract_text_from_step_payload(payload) {
+                    if !text.is_empty() {
+                        pending_agent_parts.push(text);
+                    }
+                }
+                if let Some(text) = extract_thought_from_step_payload(payload) {
+                    pending_thought_parts.push(text);
+                }
+            } else if is_tool_step_type(*step_type) {
+                flush_agent_message(
+                    &mut pending_agent_parts,
+                    &mut updates,
+                    &mut output_bytes,
+                    skip_naration,
+                )?;
+                flush_thought_message(&mut pending_thought_parts, &mut updates, &mut output_bytes)?;
+                if let Some(update) =
+                    extract_tool_update_from_step_payload(*idx, *step_type, payload)
+                {
+                    push_replay_update(&mut updates, &mut output_bytes, update)?;
+                }
+            } else if *step_type == 23 {
+                flush_agent_message(
+                    &mut pending_agent_parts,
+                    &mut updates,
+                    &mut output_bytes,
+                    skip_naration,
+                )?;
+                flush_thought_message(&mut pending_thought_parts, &mut updates, &mut output_bytes)?;
+                if let Some(title) = extract_title_from_step_payload(payload) {
+                    push_replay_update(
+                        &mut updates,
+                        &mut output_bytes,
+                        serde_json::json!({
+                            "sessionUpdate": "session_info_update",
+                            "title": title,
+                        }),
+                    )?;
                 }
             }
-            if let Some(text) = extract_thought_from_step_payload(payload) {
-                pending_thought_parts.push(text);
-            }
-        } else if is_tool_step_type(*step_type) {
-            flush_agent_message(&mut pending_agent_parts, &mut updates, skip_naration);
-            flush_thought_message(&mut pending_thought_parts, &mut updates);
-            if let Some(update) = extract_tool_update_from_step_payload(*idx, *step_type, payload) {
-                updates.push(update);
-            }
-        } else if *step_type == 23 {
-            flush_agent_message(&mut pending_agent_parts, &mut updates, skip_naration);
-            flush_thought_message(&mut pending_thought_parts, &mut updates);
-            if let Some(title) = extract_title_from_step_payload(payload) {
-                updates.push(serde_json::json!({
-                    "sessionUpdate": "session_info_update",
-                    "title": title,
-                }));
-            }
+        }
+
+        let page_last_idx = rows
+            .last()
+            .map(|(idx, _, _)| *idx)
+            .unwrap_or(after_step_idx);
+        if page_last_idx <= after_step_idx {
+            return Err(ReplayReadError::Unavailable);
+        }
+        after_step_idx = page_last_idx;
+    }
+
+    flush_agent_message(
+        &mut pending_agent_parts,
+        &mut updates,
+        &mut output_bytes,
+        skip_naration,
+    )?;
+    flush_thought_message(&mut pending_thought_parts, &mut updates, &mut output_bytes)?;
+
+    if !saw_rows {
+        Ok(None)
+    } else {
+        Ok(Some((updates, max_idx)))
+    }
+}
+
+fn push_replay_update(
+    updates: &mut Vec<Value>,
+    output_bytes: &mut usize,
+    update: Value,
+) -> Result<(), ReplayReadError> {
+    let update_bytes = serde_json::to_vec(&update)
+        .map_err(|_| ReplayReadError::Unavailable)?
+        .len();
+    let next_output_bytes = output_bytes.saturating_add(update_bytes);
+    if next_output_bytes > MAX_REPLAY_OUTPUT_BYTES {
+        return Err(ReplayReadError::BudgetExceeded);
+    }
+    *output_bytes = next_output_bytes;
+    updates.push(update);
+    Ok(())
+}
+
+fn flush_agent_message(
+    parts: &mut Vec<String>,
+    updates: &mut Vec<Value>,
+    output_bytes: &mut usize,
+    skip_naration: bool,
+) -> Result<(), ReplayReadError> {
+    if parts.is_empty() {
+        return Ok(());
+    }
+    let text = if skip_naration {
+        filter_narration(parts)
+    } else {
+        Some(parts.join("\n"))
+    };
+    parts.clear();
+    if let Some(text) = text {
+        if !text.is_empty() {
+            push_replay_update(
+                updates,
+                output_bytes,
+                message_chunk_update("agent_message_chunk", text),
+            )?;
         }
     }
-    flush_agent_message(&mut pending_agent_parts, &mut updates, skip_naration);
-    flush_thought_message(&mut pending_thought_parts, &mut updates);
+    Ok(())
+}
 
-    if updates.is_empty() {
-        return None;
+fn flush_thought_message(
+    parts: &mut Vec<String>,
+    updates: &mut Vec<Value>,
+    output_bytes: &mut usize,
+) -> Result<(), ReplayReadError> {
+    if parts.is_empty() {
+        return Ok(());
     }
-    Some((updates, max_idx))
+    let text = parts.join("\n");
+    parts.clear();
+    if !text.is_empty() {
+        push_replay_update(
+            updates,
+            output_bytes,
+            message_chunk_update("agent_thought_chunk", text),
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -283,32 +425,4 @@ pub fn read_delta_from_db(
         text,
         max_step_idx: max_idx,
     })
-}
-
-fn flush_agent_message(parts: &mut Vec<String>, updates: &mut Vec<Value>, skip_naration: bool) {
-    if parts.is_empty() {
-        return;
-    }
-    let text = if skip_naration {
-        filter_narration(parts)
-    } else {
-        Some(parts.join("\n"))
-    };
-    parts.clear();
-    if let Some(text) = text {
-        if !text.is_empty() {
-            updates.push(message_chunk_update("agent_message_chunk", text));
-        }
-    }
-}
-
-fn flush_thought_message(parts: &mut Vec<String>, updates: &mut Vec<Value>) {
-    if parts.is_empty() {
-        return;
-    }
-    let text = parts.join("\n");
-    parts.clear();
-    if !text.is_empty() {
-        updates.push(message_chunk_update("agent_thought_chunk", text));
-    }
 }

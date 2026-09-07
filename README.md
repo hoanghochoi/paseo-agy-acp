@@ -99,7 +99,8 @@ Non-empty `mcpServers` lists are rejected because `agy-acp` does not currently f
 - All JSON-RPC responses and `session/update` notifications flow through one stdout writer, preserving complete newline-delimited JSON messages under concurrent activity.
 - Prompt content must be a non-empty array of text blocks with string `text` values. Unsupported, mixed, or malformed content fails explicitly instead of being silently dropped.
 - Input and subprocess buffers are bounded: JSON-RPC frames are limited to 1 MiB, prompt text to 256 KiB, `AGY_EXTRA_ARGS` to 64 KiB, model discovery output to 256 KiB, child stdout to 4 MiB, and each SQLite step payload to 1 MiB. Oversized frames fail with an invalid-request response; oversized runtime data fails closed without unbounded allocation.
-- SQLite polling reads at most 256 steps per pass and advances over oversized payloads, so a long conversation cannot force one poll to materialize its entire history. Invocation log scans use bounded prefix/tail windows.
+- SQLite polling reads at most 256 steps and 4 MiB of payload per pass, and advances over oversized payloads, so a long conversation cannot force one poll to materialize its entire history. Session replay paginates across pages but fails closed above an 8 MiB history budget rather than returning a partial cursor. Invocation log scans use bounded prefix/tail windows.
+- Persisted `sessions.json` is capped at 1 MiB and 1024 sessions; oversized or malformed state is rejected before it can enter the in-memory session cache.
 - Cancelling a prompt terminates the full child process tree on Windows and suppresses the helper command's output from the ACP stdout stream.
 
 ## Local Verification

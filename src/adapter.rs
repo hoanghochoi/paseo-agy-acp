@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 #[cfg(test)]
 use crate::db::read_delta_from_db;
-use crate::db::read_replay_updates_from_db;
+use crate::db::{read_replay_updates_from_db, ReplayReadError};
 use crate::runtime::PromptOutcome;
 use crate::types::*;
 
@@ -20,6 +20,12 @@ const MODEL_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 pub(crate) const MAX_PROMPT_TEXT_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_MODEL_OUTPUT_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_EXTRA_ARGS_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_PERSISTED_STATE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_PERSISTED_SESSIONS: usize = 1024;
+const MAX_PERSISTED_SESSION_ID_BYTES: usize = 256;
+const MAX_PERSISTED_CONVERSATION_ID_BYTES: usize = 128;
+const MAX_PERSISTED_MODEL_ID_BYTES: usize = 256;
+const MAX_PERSISTED_CWD_BYTES: usize = 16 * 1024;
 
 fn persistence_error(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::error(id, -32603, PERSISTENCE_FAILURE_MESSAGE)
@@ -165,6 +171,62 @@ fn read_file_bounded(path: &std::path::Path, max_bytes: usize) -> Option<Vec<u8>
         .read_to_end(&mut output)
         .ok()?;
     (output.len() <= max_bytes).then_some(output)
+}
+
+fn read_state_file_bounded(path: &std::path::Path) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let mut output = Vec::new();
+    file.take((MAX_PERSISTED_STATE_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut output)?;
+    if output.len() > MAX_PERSISTED_STATE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted session state exceeds maximum size",
+        ));
+    }
+    Ok(output)
+}
+
+fn invalid_state(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn validate_store_bounds(store: &SessionStore) -> io::Result<()> {
+    if store.sessions.len() > MAX_PERSISTED_SESSIONS {
+        return Err(invalid_state("persisted session count exceeds maximum"));
+    }
+    for (session_id, session) in &store.sessions {
+        if session_id.is_empty() || session_id.len() > MAX_PERSISTED_SESSION_ID_BYTES {
+            return Err(invalid_state("persisted session ID exceeds maximum size"));
+        }
+        if session
+            .conversation_id
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_PERSISTED_CONVERSATION_ID_BYTES)
+        {
+            return Err(invalid_state(
+                "persisted conversation ID exceeds maximum size",
+            ));
+        }
+        if session
+            .model_id
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_PERSISTED_MODEL_ID_BYTES)
+        {
+            return Err(invalid_state("persisted model ID exceeds maximum size"));
+        }
+        if session
+            .cwd
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_PERSISTED_CWD_BYTES)
+        {
+            return Err(invalid_state("persisted cwd exceeds maximum size"));
+        }
+        if session.last_step_idx < -1 {
+            return Err(invalid_state("persisted step cursor is invalid"));
+        }
+    }
+    Ok(())
 }
 
 pub struct Adapter {
@@ -334,15 +396,17 @@ impl Adapter {
 
     /// Load persisted session store (caller must hold lock).
     fn load_store_inner(&self) -> io::Result<SessionStore> {
-        let file = match fs::File::open(&self.state_file) {
-            Ok(file) => file,
+        let bytes = match read_state_file_bounded(&self.state_file) {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(SessionStore::default())
+                return Ok(SessionStore::default());
             }
             Err(error) => return Err(error),
         };
-        serde_json::from_reader(&file)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        let store: SessionStore = serde_json::from_slice(&bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        validate_store_bounds(&store)?;
+        Ok(store)
     }
 
     /// Load persisted session store with lock.
@@ -358,10 +422,17 @@ impl Adapter {
     }
 
     fn write_store_inner(&self, store: &SessionStore) -> io::Result<()> {
+        validate_store_bounds(store)?;
+        let contents = serde_json::to_vec_pretty(store)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if contents.len() > MAX_PERSISTED_STATE_BYTES {
+            return Err(invalid_state(
+                "persisted session state exceeds maximum size",
+            ));
+        }
         let tmp = self.state_file.with_extension("tmp");
         let mut file = fs::File::create(&tmp)?;
-        serde_json::to_writer_pretty(&mut file, store)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        file.write_all(&contents)?;
         file.flush()?;
         file.sync_all()?;
         drop(file);
@@ -394,7 +465,7 @@ impl Adapter {
     pub fn read_replay_updates_from_db_inner(
         &self,
         conversation_id: &str,
-    ) -> Option<(Vec<Value>, i64)> {
+    ) -> Result<Option<(Vec<Value>, i64)>, ReplayReadError> {
         read_replay_updates_from_db(&self.conversations_dir, conversation_id, self.skip_naration)
     }
 
@@ -564,10 +635,23 @@ impl Adapter {
             }
         };
 
-        let replay = candidate
-            .conversation_id
-            .as_deref()
-            .and_then(|conversation_id| self.read_replay_updates_from_db_inner(conversation_id));
+        let replay = match candidate.conversation_id.as_deref() {
+            Some(conversation_id) => {
+                match self.read_replay_updates_from_db_inner(conversation_id) {
+                    Ok(replay) => replay,
+                    Err(ReplayReadError::Unavailable) => None,
+                    Err(ReplayReadError::BudgetExceeded) => {
+                        return vec![serde_json::to_string(&JsonRpcResponse::error(
+                            id,
+                            -32000,
+                            "conversation history exceeds replay budget",
+                        ))
+                        .unwrap()];
+                    }
+                }
+            }
+            None => None,
+        };
         if let Some((_, max_step_idx)) = &replay {
             candidate.last_step_idx = *max_step_idx;
         }
