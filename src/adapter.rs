@@ -2,7 +2,7 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -17,6 +17,9 @@ use crate::types::*;
 const PERSISTENCE_FAILURE_MESSAGE: &str = "failed to persist session state";
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const MAX_PROMPT_TEXT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_MODEL_OUTPUT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_EXTRA_ARGS_BYTES: usize = 64 * 1024;
 
 fn persistence_error(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::error(id, -32603, PERSISTENCE_FAILURE_MESSAGE)
@@ -46,6 +49,9 @@ fn validate_prompt_text(params: &Value) -> Result<String, &'static str> {
     let prompt_text = text_blocks.join("\n").trim().to_string();
     if prompt_text.is_empty() {
         return Err("prompt text must not be empty");
+    }
+    if prompt_text.len() > MAX_PROMPT_TEXT_BYTES {
+        return Err("prompt text exceeds maximum size");
     }
     Ok(prompt_text)
 }
@@ -133,6 +139,34 @@ fn parse_available_models(output: &str) -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn parse_available_models_bounded(output: &[u8]) -> Vec<String> {
+    if output.len() > MAX_MODEL_OUTPUT_BYTES {
+        return Vec::new();
+    }
+    parse_available_models(&String::from_utf8_lossy(output))
+}
+
+pub(crate) fn parse_extra_args_bounded(extra: &str) -> Option<Vec<std::ffi::OsString>> {
+    if extra.len() > MAX_EXTRA_ARGS_BYTES {
+        return None;
+    }
+    Some(
+        extra
+            .split_whitespace()
+            .map(std::ffi::OsString::from)
+            .collect(),
+    )
+}
+
+fn read_file_bounded(path: &std::path::Path, max_bytes: usize) -> Option<Vec<u8>> {
+    let file = fs::File::open(path).ok()?;
+    let mut output = Vec::new();
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut output)
+        .ok()?;
+    (output.len() <= max_bytes).then_some(output)
+}
+
 pub struct Adapter {
     pub sessions: HashMap<String, Session>,
     pub conversations_dir: PathBuf,
@@ -193,9 +227,8 @@ impl Adapter {
         let models = loop {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => {
-                    break fs::read(&output_path)
-                        .ok()
-                        .map(|output| parse_available_models(&String::from_utf8_lossy(&output)))
+                    break read_file_bounded(&output_path, MAX_MODEL_OUTPUT_BYTES)
+                        .map(|output| parse_available_models_bounded(&output))
                         .unwrap_or_default();
                 }
                 Ok(Some(_)) => break Vec::new(),

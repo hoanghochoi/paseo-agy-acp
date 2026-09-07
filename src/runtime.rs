@@ -11,8 +11,8 @@ use std::sync::{
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWrite};
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -21,10 +21,60 @@ use crate::output::{self, OutputSender};
 use crate::protocol::{parse_jsonrpc_line, IncomingMessage, RpcCall};
 use crate::streaming::poll_streaming_delta;
 use crate::types::{JsonRpcNotification, JsonRpcResponse, PromptExecution, StreamingState};
+use crate::OVERSIZED_INPUT_SENTINEL;
 
 pub(crate) const MAX_RUNTIME_ERROR_MESSAGE_LEN: usize = 256;
+pub(crate) const MAX_CHILD_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CHILD_STDOUT_DRAIN_TIME: Duration = Duration::from_secs(2);
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Default)]
+pub(crate) struct LimitedChildOutput {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
+}
+
+pub(crate) async fn read_limited_child_output<R>(mut reader: R) -> LimitedChildOutput
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = LimitedChildOutput::default();
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let remaining = MAX_CHILD_STDOUT_BYTES.saturating_sub(output.bytes.len());
+                let retained = read.min(remaining);
+                output.bytes.extend_from_slice(&buffer[..retained]);
+                if retained < read {
+                    output.truncated = true;
+                }
+            }
+        }
+    }
+    output
+}
+
+async fn terminate_child_tree(child: &mut Child) -> io::Result<()> {
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let pid = pid.to_string();
+        if let Ok(status) = Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+        {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+    child.kill().await
+}
 
 pub(crate) fn next_poll_delay(current: Duration, emitted_delta: bool) -> Duration {
     if emitted_delta {
@@ -232,7 +282,17 @@ pub(crate) async fn execute_prompt(
             .into(),
     ];
     if let Ok(extra) = std::env::var("AGY_EXTRA_ARGS") {
-        args.extend(extra.split_whitespace().map(OsString::from));
+        let Some(extra_args) = crate::adapter::parse_extra_args_bounded(&extra) else {
+            return PromptOutcome {
+                session_id,
+                conversation_id,
+                last_step_idx: initial_step_idx,
+                response: JsonRpcResponse::error(id, -32602, "AGY_EXTRA_ARGS exceeds maximum size"),
+                run_log_path,
+                remove_run_log_on_commit: false,
+            };
+        };
+        args.extend(extra_args);
     }
     if let Some(conv_id) = &conversation_id {
         args.push("--conversation".into());
@@ -273,16 +333,16 @@ pub(crate) async fn execute_prompt(
     };
 
     let mut stdout = child.stdout.take();
-    let stdout_reader = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut stdout) = stdout.take() {
-            let _ = stdout.read_to_end(&mut buf).await;
+    let mut stdout_reader = tokio::spawn(async move {
+        if let Some(stdout) = stdout.take() {
+            read_limited_child_output(stdout).await
+        } else {
+            LimitedChildOutput::default()
         }
-        buf
     });
 
     let mut stderr = child.stderr.take();
-    let stderr_reader = tokio::spawn(async move {
+    let mut stderr_reader = tokio::spawn(async move {
         if let Some(mut stderr) = stderr.take() {
             let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
         }
@@ -337,13 +397,31 @@ pub(crate) async fn execute_prompt(
             }
         } => {
             was_cancelled = true;
-            let _ = child.kill().await;
+            let _ = terminate_child_tree(&mut child).await;
             child.wait().await
         }
     };
-    let stdout_bytes = stdout_reader.await.unwrap_or_default();
-    let stdout_text = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
-    let _ = stderr_reader.await;
+    let stdout_output =
+        match tokio::time::timeout(MAX_CHILD_STDOUT_DRAIN_TIME, &mut stdout_reader).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(_)) | Err(_) => {
+                stdout_reader.abort();
+                LimitedChildOutput {
+                    bytes: Vec::new(),
+                    truncated: true,
+                }
+            }
+        };
+    let stdout_text = String::from_utf8_lossy(&stdout_output.bytes)
+        .trim()
+        .to_string();
+    let stdout_truncated = stdout_output.truncated;
+    if tokio::time::timeout(MAX_CHILD_STDOUT_DRAIN_TIME, &mut stderr_reader)
+        .await
+        .is_err()
+    {
+        stderr_reader.abort();
+    }
     stop_polling.store(true, Ordering::SeqCst);
     poller.wait().await;
 
@@ -361,7 +439,11 @@ pub(crate) async fn execute_prompt(
     }
 
     let had_agent_text_before_stdout = streaming_state.lock().unwrap().had_agent_text;
-    if !was_cancelled && !had_agent_text_before_stdout && !stdout_text.is_empty() {
+    if !was_cancelled
+        && !stdout_truncated
+        && !had_agent_text_before_stdout
+        && !stdout_text.is_empty()
+    {
         final_lines.push(
             serde_json::to_string(&JsonRpcNotification {
                 jsonrpc: "2.0",
@@ -421,7 +503,19 @@ pub(crate) async fn execute_prompt(
                 );
                 JsonRpcResponse::error(id, -32000, &message)
             } else if !was_cancelled && !had_agent_text {
-                JsonRpcResponse::error(id, -32000, "agy completed without an assistant response")
+                if stdout_truncated {
+                    JsonRpcResponse::error(
+                        id,
+                        -32000,
+                        "agy stdout exceeded the maximum buffered size",
+                    )
+                } else {
+                    JsonRpcResponse::error(
+                        id,
+                        -32000,
+                        "agy completed without an assistant response",
+                    )
+                }
             } else {
                 success_response
             }
@@ -508,6 +602,14 @@ async fn dispatch_line(
     done: &mpsc::UnboundedSender<()>,
     output: &OutputSender,
 ) -> bool {
+    if line == OVERSIZED_INPUT_SENTINEL {
+        let _ = output::send_response(
+            output,
+            JsonRpcResponse::error(Value::Null, -32600, "Request exceeds maximum line length"),
+        )
+        .await;
+        return false;
+    }
     match parse_jsonrpc_line(line) {
         Err(response) => {
             let _ = output::send_response(output, response).await;

@@ -52,11 +52,12 @@ No separate lint/typecheck/format commands — just `cargo build` and `cargo tes
 - `rusqlite` uses `bundled` feature — no system SQLite dependency needed.
 - SQLite reads use `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX` — single-threaded access assumed per conversation DB.
 - State persistence uses write-to-tmp-then-rename pattern under an exclusive file lock (`fs2`).
-- Streaming writes JSON-RPC notifications directly to stdout from a background polling thread (not through the main channel). Both the main loop and the poller write to stdout concurrently.
+- Streaming notifications and responses share one bounded output channel and writer, so concurrent prompts cannot interleave bytes on stdout.
 - `handle_session_load` returns a `Vec<String>` (multiple notifications + final response), not a single response like other methods.
 - Conversation binding: every `agy` invocation gets a unique `--log-file`; the adapter reads that invocation's `Created conversation <uuid>` record (or its own child PID's open DB as a fallback). Never infer ownership from a process-global directory diff, because parallel invocations can otherwise cross-bind.
 - Final-answer recovery: SQLite provides streaming/tool/history updates, while captured `agy --print` stdout is the fallback when SQLite emitted no assistant text. A successful process with no conversation ID or no assistant response fails closed instead of returning an empty `end_turn`.
 - Turn completion: the bridge raises `agy --print-timeout` to 24 hours by default and treats an observed print timeout or any non-zero `agy` exit as a failed ACP turn, even if partial updates were streamed. It never converts either condition into `end_turn`.
 - `fetch_available_models()` runs `agy models` synchronously during `Adapter::new()` with a 5-second deadline. If `agy` isn't installed, times out, or exits unsuccessfully, the models list is empty (no error).
-- `session/cancel` is a no-op — always returns `{}`.
+- `session/cancel` marks the active prompt cancelled; on Windows the adapter terminates the child process tree before returning the cancelled response.
 - Both `session/set_model` and `session/setConfigOption` are accepted for model selection.
+- Runtime input and output are bounded: JSON-RPC frames (1 MiB), prompt text (256 KiB), `AGY_EXTRA_ARGS` (64 KiB), model discovery output (256 KiB), child stdout (4 MiB), SQLite step payloads (1 MiB), and SQLite rows per poll (256). Oversized data fails closed or advances the cursor without retaining the payload.

@@ -42,6 +42,172 @@ use std::time::Duration;
 use tokio::io::AsyncWrite;
 
 #[test]
+fn oversized_protocol_line_is_rejected_without_forwarding_payload() {
+    let oversized = format!("{}\n", "x".repeat(crate::MAX_INPUT_LINE_BYTES + 1));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    crate::forward_input_lines(std::io::Cursor::new(oversized), sender).unwrap();
+
+    assert_eq!(
+        receiver.try_recv().unwrap(),
+        crate::OVERSIZED_INPUT_SENTINEL
+    );
+    assert!(receiver.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn oversized_protocol_line_emits_bounded_invalid_request() {
+    use tokio::io::{duplex, AsyncReadExt};
+
+    let root = fresh_test_root("oversized-protocol-frame");
+    let adapter = test_adapter(&root);
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    crate::forward_input_lines(
+        std::io::Cursor::new(format!("{}\n", "x".repeat(crate::MAX_INPUT_LINE_BYTES + 1))),
+        sender,
+    )
+    .unwrap();
+    let (writer_side, mut reader_side) = duplex(4096);
+    crate::runtime::run_bridge(adapter, receiver, writer_side)
+        .await
+        .unwrap();
+
+    let mut output = String::new();
+    reader_side.read_to_string(&mut output).await.unwrap();
+    let response: Value = serde_json::from_str(output.trim()).unwrap();
+    assert_eq!(response["error"]["code"], -32600);
+    assert_eq!(
+        response["error"]["message"],
+        "Request exceeds maximum line length"
+    );
+    assert!(output.len() < 256);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn prompt_text_limit_rejects_oversized_input() {
+    let root = fresh_test_root("oversized-prompt");
+    let mut adapter = test_adapter(&root);
+    let cwd = root.to_string_lossy().to_string();
+    let session_id = open_test_session(&mut adapter, &root);
+    let error = adapter
+        .prepare_prompt(
+            json!(1),
+            &json!({
+                "sessionId": session_id,
+                "prompt": [{
+                    "type": "text",
+                    "text": "x".repeat(crate::adapter::MAX_PROMPT_TEXT_BYTES + 1)
+                }],
+                "cwd": cwd,
+            }),
+        )
+        .unwrap_err();
+
+    let error_value = error.error.unwrap();
+    assert_eq!(error_value["code"], -32602);
+    assert_eq!(error_value["message"], "prompt text exceeds maximum size");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn limited_child_stdout_caps_buffer_and_drains_reader() {
+    let (mut writer, reader) = tokio::io::duplex(crate::runtime::MAX_CHILD_STDOUT_BYTES + 1);
+    let payload = vec![b'x'; crate::runtime::MAX_CHILD_STDOUT_BYTES + 1];
+    let writer_task = tokio::spawn(async move {
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &payload)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut writer)
+            .await
+            .unwrap();
+    });
+
+    let output = crate::runtime::read_limited_child_output(reader).await;
+    writer_task.await.unwrap();
+    assert_eq!(output.bytes.len(), crate::runtime::MAX_CHILD_STDOUT_BYTES);
+    assert!(output.truncated);
+}
+
+#[test]
+fn model_output_parser_rejects_oversized_output() {
+    let output = "x".repeat(crate::adapter::MAX_MODEL_OUTPUT_BYTES + 1);
+    assert!(crate::adapter::parse_available_models_bounded(output.as_bytes()).is_empty());
+}
+
+#[test]
+fn extra_args_parser_rejects_oversized_environment_input() {
+    let output = "--flag ".repeat(crate::adapter::MAX_EXTRA_ARGS_BYTES / 7 + 1);
+    assert!(crate::adapter::parse_extra_args_bounded(&output).is_none());
+}
+
+#[test]
+fn invocation_log_scan_stays_bounded_and_keeps_prefix_marker() {
+    let root = fresh_test_root("bounded-run-log");
+    let path = root.join("run.log");
+    let conversation_id = "00000000-0000-4000-8000-000000000031";
+    let mut contents = format!("Created conversation {conversation_id}\n").into_bytes();
+    contents.extend(std::iter::repeat_n(
+        b'x',
+        crate::db::MAX_INVOCATION_LOG_BYTES + 1,
+    ));
+    fs::write(&path, contents).unwrap();
+
+    assert_eq!(
+        crate::db::find_created_conversation_id_in_log(&path).as_deref(),
+        Some(conversation_id)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn timeout_log_scan_keeps_bounded_tail_marker() {
+    let root = fresh_test_root("bounded-timeout-log");
+    let path = root.join("run.log");
+    let mut contents = vec![b'x'; crate::db::MAX_INVOCATION_LOG_BYTES + 1];
+    contents.extend_from_slice(b"Print mode: timed out\n");
+    fs::write(&path, contents).unwrap();
+
+    assert!(crate::db::agy_run_timed_out(&path));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn db_row_reader_bounds_rows_and_payloads() {
+    let root = fresh_test_root("bounded-db-rows");
+    let conversations_dir = root.join("conversations");
+    fs::create_dir_all(&conversations_dir).unwrap();
+    let conversation_id = "00000000-0000-4000-8000-000000000030";
+    let db_path = conversations_dir.join(format!("{conversation_id}.db"));
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, step_payload BLOB)",
+    )
+    .unwrap();
+    for idx in 0..(crate::db::MAX_DB_ROWS_PER_READ as i64 + 3) {
+        let payload = if idx == 0 {
+            vec![b'x'; crate::db::MAX_STEP_PAYLOAD_BYTES + 1]
+        } else {
+            vec![idx as u8]
+        };
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
+            rusqlite::params![idx, payload],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let rows = crate::db::read_rows_from_db(&conversations_dir, conversation_id, -1).unwrap();
+    assert_eq!(rows.len(), crate::db::MAX_DB_ROWS_PER_READ);
+    assert!(rows[0].2.is_empty(), "oversized payload must be redacted");
+    assert!(rows
+        .iter()
+        .all(|(_, _, payload)| { payload.len() <= crate::db::MAX_STEP_PAYLOAD_BYTES }));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn active_prompts_allow_different_sessions_and_reject_duplicates() {
     // Break caught: replacing an in-flight registration for the same session.
     let active = crate::runtime::ActivePrompts::default();
@@ -791,6 +957,27 @@ fn adapter_model_discovery_keeps_fast_model_output() {
 }
 
 #[test]
+fn adapter_model_discovery_rejects_oversized_model_output() {
+    let root = fresh_test_root("models-oversized");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_models_stub(
+        &bin_dir,
+        &format!(
+            "print!(\"{{}}\", \"x\".repeat({}));",
+            crate::adapter::MAX_MODEL_OUTPUT_BYTES + 1
+        ),
+    );
+
+    let probe = launch_model_discovery_probe("tests::model_discovery_oversized_probe", &bin_dir);
+    assert!(
+        probe.success(),
+        "oversized model discovery probe failed: {probe}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn model_discovery_timeout_probe() {
     if std::env::var("AGY_ACP_MODEL_DISCOVERY_PROBE").as_deref() != Ok("1") {
         return;
@@ -833,6 +1020,21 @@ fn model_discovery_success_probe() {
             "gemini-plain".to_string()
         ]
     );
+}
+
+#[test]
+fn model_discovery_oversized_probe() {
+    if std::env::var("AGY_ACP_MODEL_DISCOVERY_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+
+    let bin_dir = PathBuf::from(std::env::var_os("AGY_ACP_MODEL_DISCOVERY_BIN").unwrap());
+    let parent_path = std::env::var_os("AGY_ACP_MODEL_DISCOVERY_PARENT_PATH").unwrap();
+    let path = std::env::join_paths([bin_dir.as_os_str(), parent_path.as_os_str()]).unwrap();
+    std::env::set_var("PATH", path);
+
+    let adapter = Adapter::new();
+    assert!(adapter.available_models.is_empty());
 }
 
 fn launch_model_discovery_probe(
@@ -913,11 +1115,17 @@ for ($i = 0; $i -lt $args.Count; $i++) {
 }
 Set-Content -LiteralPath $logFile -Value 'Created conversation 00000000-0000-4000-8000-000000000099' -Encoding utf8
 if ($prompt -eq 'slow') { Start-Sleep -Milliseconds 3000 }
+if ($prompt -eq 'tree') {
+    $descendant = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30' -PassThru
+    Set-Content -LiteralPath ($logFile + '.child') -Value $descendant.Id -Encoding ascii
+    Start-Sleep -Seconds 30
+}
 if ($prompt -eq 'stderr-fail') {
     [Console]::Error.WriteLine('AGY_STDERR_SECRET_SENTINEL')
     exit 7
 }
 if ($prompt -eq 'fail') { exit 7 }
+if ($prompt -eq 'huge') { [Console]::Out.Write('x' * 5000000); exit 0 }
 [Console]::Out.WriteLine('fake assistant response')
 "#;
 
@@ -943,11 +1151,17 @@ if [ "$prompt" = 'slow' ]; then
   printf '%s\n' 'fake assistant response'
   exec sleep 3
 fi
+if [ "$prompt" = 'tree' ]; then
+  (sleep 30) &
+  echo $! > "$log_file.child"
+  sleep 30
+fi
 if [ "$prompt" = 'stderr-fail' ]; then
   printf '%s\n' 'AGY_STDERR_SECRET_SENTINEL' >&2
   exit 7
 fi
 if [ "$prompt" = 'fail' ]; then exit 7; fi
+if [ "$prompt" = 'huge' ]; then head -c 5000000 /dev/zero | tr '\\0' 'x'; exit 0; fi
 printf '%s\n' 'fake assistant response'
 "#;
 
@@ -1122,6 +1336,82 @@ async fn cancellation_finishes_a_slow_fake_child_without_waiting_for_timeout() {
         .unwrap();
 
     assert_eq!(outcome.response.result.unwrap()["stopReason"], "cancelled");
+}
+
+#[tokio::test]
+async fn oversized_child_stdout_fails_closed_without_buffering_all_output() {
+    let mut harness = ConcurrentHarness::new("huge-stdout");
+    let execution = harness.prepare("session-a", "huge");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::runtime::execute_prompt(
+            execution,
+            Arc::new(AtomicBool::new(false)),
+            harness.output.clone(),
+        ),
+    )
+    .await
+    .expect("huge fake stdout did not finish promptly");
+
+    assert_eq!(
+        outcome.response.error.unwrap()["message"],
+        "agy stdout exceeded the maximum buffered size"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn cancellation_terminates_windows_process_tree() {
+    let mut harness = ConcurrentHarness::new("cancel-tree");
+    let execution = harness.prepare("session-a", "tree");
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn(crate::runtime::execute_prompt(
+        execution,
+        cancelled.clone(),
+        harness.output.clone(),
+    ));
+    wait_for_fake_run_log(&harness.root).await;
+
+    let log_path = fs::read_dir(harness.root.join("state").join("run-logs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("log"))
+        .unwrap();
+    let child_path = log_path.with_file_name(format!(
+        "{}.child",
+        log_path.file_name().unwrap().to_string_lossy()
+    ));
+    let child_pid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(pid) = fs::read_to_string(&child_path) {
+                if let Ok(pid) = pid.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fake descendant did not start");
+
+    cancelled.store(true, Ordering::SeqCst);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("process-tree cancellation did not finish")
+        .unwrap();
+    assert_eq!(outcome.response.result.unwrap()["stopReason"], "cancelled");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let tasklist = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {child_pid}"), "/NH"])
+        .output()
+        .unwrap();
+    let tasklist = String::from_utf8_lossy(&tasklist.stdout);
+    assert!(
+        !tasklist.contains(&child_pid.to_string()),
+        "descendant survived: {tasklist}"
+    );
 }
 
 #[tokio::test]
@@ -3906,7 +4196,7 @@ fn test_e2e_session_load() {
         &mut reader,
         3,
         &session_id,
-        "Reply with exactly: FIRST_TURN",
+        "Answer from this prompt only. Do not call any tools. Reply with exactly: FIRST_TURN",
     );
     assert!(
         resp1["error"].is_null(),
@@ -3919,7 +4209,7 @@ fn test_e2e_session_load() {
         &mut reader,
         4,
         &session_id,
-        "Reply with exactly one word: SECOND",
+        "Using only the existing conversation context, do not call any tools. Reply with exactly one word: SECOND",
     );
     assert!(
         resp2["error"].is_null(),

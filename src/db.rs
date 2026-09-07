@@ -1,6 +1,7 @@
 use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -10,6 +11,36 @@ use crate::protobuf::{
     extract_title_from_step_payload, extract_tool_update_from_step_payload,
     extract_user_text_from_step_payload, is_tool_step_type, message_chunk_update,
 };
+
+/// Bound one SQLite read so a long-running turn cannot materialize an
+/// unbounded tail of history in one poll.
+pub(crate) const MAX_DB_ROWS_PER_READ: usize = 256;
+/// Oversized step payloads are represented as empty payloads and still advance
+/// the cursor, preventing repeated allocation and retry of malformed data.
+pub(crate) const MAX_STEP_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_INVOCATION_LOG_BYTES: usize = 256 * 1024;
+
+fn read_log_prefix(path: &Path) -> Option<Vec<u8>> {
+    let file = fs::File::open(path).ok()?;
+    let mut output = Vec::new();
+    file.take(MAX_INVOCATION_LOG_BYTES as u64)
+        .read_to_end(&mut output)
+        .ok()?;
+    Some(output)
+}
+
+fn read_log_tail(path: &Path) -> Option<Vec<u8>> {
+    let mut file = fs::File::open(path).ok()?;
+    let start = file
+        .metadata()
+        .ok()?
+        .len()
+        .saturating_sub(MAX_INVOCATION_LOG_BYTES as u64);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut output = Vec::new();
+    file.read_to_end(&mut output).ok()?;
+    Some(output)
+}
 
 #[cfg(test)]
 use crate::types::ConversationDelta;
@@ -21,7 +52,7 @@ use crate::types::ConversationDelta;
 /// the same time.
 pub fn find_created_conversation_id_in_log(log_path: &Path) -> Option<String> {
     const MARKER: &str = "Created conversation ";
-    let contents = fs::read_to_string(log_path).ok()?;
+    let contents = String::from_utf8_lossy(&read_log_prefix(log_path)?).into_owned();
     contents.lines().find_map(|line| {
         let candidate = line.split_once(MARKER)?.1.split_whitespace().next()?;
         Uuid::parse_str(candidate).ok().map(|id| id.to_string())
@@ -29,9 +60,8 @@ pub fn find_created_conversation_id_in_log(log_path: &Path) -> Option<String> {
 }
 
 pub fn agy_run_timed_out(log_path: &Path) -> bool {
-    fs::read_to_string(log_path)
-        .map(|contents| contents.contains("Print mode: timed out"))
-        .unwrap_or(false)
+    String::from_utf8_lossy(&read_log_tail(log_path).unwrap_or_default())
+        .contains("Print mode: timed out")
 }
 
 pub fn find_conversation_id_by_pid(_pid: u32, _conversations_dir: &Path) -> Option<String> {
@@ -130,12 +160,25 @@ pub fn read_rows_from_db(
     }
 
     let mut stmt = conn
-        .prepare("SELECT idx, step_type, step_payload FROM steps WHERE idx > ?1 ORDER BY idx")
+        .prepare(
+            "SELECT idx, step_type,
+                    CASE WHEN step_payload IS NULL OR length(step_payload) > ?2
+                         THEN NULL ELSE step_payload END
+             FROM steps WHERE idx > ?1 ORDER BY idx LIMIT ?3",
+        )
         .ok()?;
     let rows: Vec<(i64, i64, Vec<u8>)> = stmt
-        .query_map([after_step_idx], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
+        .query_map(
+            rusqlite::params![
+                after_step_idx,
+                MAX_STEP_PAYLOAD_BYTES as i64,
+                MAX_DB_ROWS_PER_READ as i64
+            ],
+            |row| {
+                let payload = row.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default();
+                Ok((row.get(0)?, row.get(1)?, payload))
+            },
+        )
         .ok()?
         .filter_map(|r| r.ok())
         .collect();
