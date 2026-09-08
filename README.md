@@ -50,7 +50,7 @@ The Paseo daemon account must be able to find `agy` and its authentication. Use 
 
 ### Model Selection
 
-`agy-acp` queries available models by running `agy models` at startup. Paseo can switch models through the ACP config options (`session/set_model` or `session/setConfigOption`). Discovery is bounded and falls back to an empty model list when `agy` is unavailable.
+`agy-acp` queries available models by running `agy models` at startup. Paseo can switch models through the ACP config options (`session/set_model` or `session/setConfigOption`). Discovery has a 30-second default deadline, configurable with `AGY_MODEL_DISCOVERY_TIMEOUT_MS`, and falls back to an empty model list when `agy` is unavailable.
 
 ### Passing Extra Arguments
 
@@ -69,6 +69,7 @@ Keep ACP stdout dedicated to protocol messages. Paseo's managed terminal/agent d
 | `GEMINI_API_KEY` | API key for Gemini (passed through to `agy`) |
 | `AGY_EXTRA_ARGS` | Space-separated extra args passed to every `agy` invocation |
 | `AGY_PRINT_TIMEOUT` | Maximum time `agy --print` may wait for a trustworthy completed turn (default `24h`) |
+| `AGY_MODEL_DISCOVERY_TIMEOUT_MS` | Maximum time to wait for `agy models` (default `30000`, capped at `120000`) |
 
 ## Session Persistence
 

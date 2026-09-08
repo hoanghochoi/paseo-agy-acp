@@ -15,7 +15,9 @@ use crate::runtime::PromptOutcome;
 use crate::types::*;
 
 const PERSISTENCE_FAILURE_MESSAGE: &str = "failed to persist session state";
-const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+const MODEL_DISCOVERY_TIMEOUT_ENV: &str = "AGY_MODEL_DISCOVERY_TIMEOUT_MS";
 const MODEL_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 pub(crate) const MAX_PROMPT_TEXT_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_MODEL_OUTPUT_BYTES: usize = 256 * 1024;
@@ -143,6 +145,7 @@ fn parse_available_models(output: &str) -> Vec<String> {
         .lines()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
+        .filter(|line| !line.eq_ignore_ascii_case("Fetching available models..."))
         .collect()
 }
 
@@ -151,6 +154,20 @@ pub(crate) fn parse_available_models_bounded(output: &[u8]) -> Vec<String> {
         return Vec::new();
     }
     parse_available_models(&String::from_utf8_lossy(output))
+}
+
+fn model_discovery_timeout() -> Duration {
+    let Some(raw) = std::env::var(MODEL_DISCOVERY_TIMEOUT_ENV).ok() else {
+        return DEFAULT_MODEL_DISCOVERY_TIMEOUT;
+    };
+    let Ok(milliseconds) = raw.trim().parse::<u64>() else {
+        return DEFAULT_MODEL_DISCOVERY_TIMEOUT;
+    };
+    Duration::from_millis(
+        milliseconds
+            .max(1)
+            .min(MAX_MODEL_DISCOVERY_TIMEOUT.as_millis() as u64),
+    )
 }
 
 pub(crate) fn parse_extra_args_bounded(extra: &str) -> Option<Vec<std::ffi::OsString>> {
@@ -346,7 +363,7 @@ impl Adapter {
                 return Vec::new();
             }
         };
-        let deadline = Instant::now() + MODEL_DISCOVERY_TIMEOUT;
+        let deadline = Instant::now() + model_discovery_timeout();
 
         let models = loop {
             match child.try_wait() {

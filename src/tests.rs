@@ -147,6 +147,15 @@ fn model_output_parser_rejects_oversized_output() {
 }
 
 #[test]
+fn model_output_parser_ignores_cli_progress_output() {
+    let output = b"Fetching available models...\ngemini-fast\tFast Model\n";
+    assert_eq!(
+        crate::adapter::parse_available_models_bounded(output),
+        vec!["gemini-fast\tFast Model"]
+    );
+}
+
+#[test]
 fn extra_args_parser_rejects_oversized_environment_input() {
     let output = "--flag ".repeat(crate::adapter::MAX_EXTRA_ARGS_BYTES / 7 + 1);
     assert!(crate::adapter::parse_extra_args_bounded(&output).is_none());
@@ -1372,6 +1381,7 @@ fn launch_model_discovery_probe(
         .env("AGY_ACP_MODEL_DISCOVERY_PROBE", "1")
         .env("AGY_ACP_MODEL_DISCOVERY_BIN", bin_dir)
         .env("AGY_ACP_MODEL_DISCOVERY_PARENT_PATH", original_path)
+        .env("AGY_MODEL_DISCOVERY_TIMEOUT_MS", "5000")
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .spawn()

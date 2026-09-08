@@ -47,6 +47,7 @@ GitHub Actions runs the format, Clippy, unit/I/O test, and release-build gates o
 |---|---|
 | `AGY_EXTRA_ARGS` | Space-separated extra args passed to every `agy` invocation |
 | `AGY_PRINT_TIMEOUT` | Override the bridge-owned `agy --print-timeout` (default `24h`) |
+| `AGY_MODEL_DISCOVERY_TIMEOUT_MS` | Override the `agy models` discovery deadline in milliseconds (default `30000`, capped at `120000`) |
 | `GEMINI_API_KEY` | API key for e2e tests and CI |
 
 ## Quirks
