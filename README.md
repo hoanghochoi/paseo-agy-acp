@@ -54,6 +54,10 @@ The Paseo daemon account must be able to find `agy` and its authentication. Use 
 
 ### Passing Extra Arguments
 
+For an opt-in primary AGY agent with a bounded inspection tool catalog, see
+[the SLP PEER profile](docs/slp-peer-profile.md). It uses the existing
+`AGY_EXTRA_ARGS` launch configuration without changing default ACP behavior.
+
 Set `AGY_EXTRA_ARGS` in the Paseo provider environment to pass additional arguments to every `agy` invocation. Values support single/double quotes and backslash escapes without invoking a shell:
 
 ```text
