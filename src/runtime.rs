@@ -346,6 +346,7 @@ pub(crate) async fn execute_prompt(
         state_dir,
         skip_naration,
         command,
+        add_dir,
         mcp_config,
     } = execution;
     let run_logs_dir = state_dir.join("run-logs");
@@ -362,6 +363,10 @@ pub(crate) async fn execute_prompt(
             .unwrap_or_else(|_| "24h".to_string())
             .into(),
     ];
+    if let Some(add_dir) = &add_dir {
+        args.push("--add-dir".into());
+        args.push(add_dir.as_os_str().to_os_string());
+    }
     if let Ok(extra) = std::env::var("AGY_EXTRA_ARGS") {
         let Some(extra_args) = crate::adapter::parse_extra_args_bounded(&extra) else {
             return PromptOutcome {

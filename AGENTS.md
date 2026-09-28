@@ -46,6 +46,7 @@ GitHub Actions runs the format, Clippy, unit/I/O test, and release-build gates o
 | Var | Effect |
 |---|---|
 | `AGY_COMMAND` | The `agy` executable for model discovery and prompt runs, where the bridge's PATH does not hold it (default `agy`) |
+| `AGY_ADD_DIR` | One more workspace folder passed with `--add-dir` to every run, read once at startup (a caller's directory of `.agents/agents`, `.agents/skills`, `.agents/rules`) |
 | `AGY_EXTRA_ARGS` | Space-separated extra args passed to every `agy` invocation |
 | `AGY_PRINT_TIMEOUT` | Override the bridge-owned `agy --print-timeout` (default `24h`) |
 | `AGY_MODEL_DISCOVERY_TIMEOUT_MS` | Override the `agy models` discovery deadline in milliseconds (default `30000`, capped at `120000`) |

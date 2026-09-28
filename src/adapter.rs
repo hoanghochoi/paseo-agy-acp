@@ -311,6 +311,8 @@ pub struct Adapter {
     pub available_models: Vec<String>,
     pub skip_naration: bool,
     pub(crate) command: CommandSpec,
+    /// `AGY_ADD_DIR`: one more workspace folder for every run, such as the directory a caller keeps a seat's agent and skills in.
+    pub(crate) add_dir: Option<PathBuf>,
     pub(crate) session_access: HashMap<String, u64>,
     pub(crate) next_access: u64,
     pub(crate) active_sessions: HashSet<String>,
@@ -337,6 +339,9 @@ impl Adapter {
             available_models: Self::fetch_available_models(),
             skip_naration,
             command: CommandSpec::new(agy_program(), Vec::new()),
+            add_dir: std::env::var_os("AGY_ADD_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
             session_access: HashMap::new(),
             next_access: 0,
             active_sessions: HashSet::new(),
@@ -1034,6 +1039,7 @@ impl Adapter {
             state_dir,
             skip_naration: self.skip_naration,
             command: self.command.clone(),
+            add_dir: self.add_dir.clone(),
             mcp_config,
         })
     }

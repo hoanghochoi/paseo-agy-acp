@@ -1948,6 +1948,7 @@ fn test_adapter(root: &std::path::Path) -> Adapter {
         available_models: vec!["fake-model\tFake Model".to_string()],
         skip_naration: false,
         command: CommandSpec::new("agy", Vec::new()),
+        add_dir: None,
         session_access: HashMap::new(),
         next_access: 0,
         active_sessions: std::collections::HashSet::new(),
@@ -2501,6 +2502,45 @@ fn session_mcp_servers_are_held_in_agy_shape_in_memory_only_and_replaced_on_resu
         adapter.handle_session_resume(json!(2), &session_lifecycle_params(&session_id, &cwd));
     assert!(resumed.error.is_none());
     assert!(!adapter.mcp_configs.contains_key(&session_id));
+}
+
+#[tokio::test]
+async fn prompt_run_adds_the_configured_workspace_folder() {
+    // Break caught: AGY_ADD_DIR read but never handed to agy, so a seat runs without its agent and skills.
+    let root = fresh_test_root("add-dir");
+    let cwd = root.join("workspace");
+    let seat = root.join("seat");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(seat.join(".agents")).unwrap();
+    let marker = json!({"mcpServers": {"from-seat": {"command": "seat"}}});
+    fs::write(
+        seat.join(".agents").join("mcp_config.json"),
+        marker.to_string(),
+    )
+    .unwrap();
+    let mut adapter = test_adapter(&root);
+    adapter.command = fake_agy_command(&root);
+    adapter.add_dir = Some(seat);
+    let session_id = open_test_session(&mut adapter, &cwd);
+    let execution = adapter
+        .prepare_prompt(
+            json!(2),
+            &json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "hi"}]}),
+        )
+        .unwrap();
+    let (output, _receiver) = crate::output::channel();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::runtime::execute_prompt(execution, Arc::new(AtomicBool::new(false)), output),
+    )
+    .await
+    .expect("fake agy did not finish");
+
+    let mut seen = outcome.run_log_path.clone().into_os_string();
+    seen.push(".mcp");
+    let seen: Value = serde_json::from_str(&fs::read_to_string(&seen).unwrap()).unwrap();
+    assert_eq!(seen, marker);
 }
 
 #[test]
