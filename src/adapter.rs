@@ -110,7 +110,8 @@ fn apply_outcome_binding(
     Ok(())
 }
 
-fn validate_session_setup(params: &Value) -> Result<PathBuf, String> {
+/// The session's absolute cwd and its MCP servers in Antigravity's shape, if it has any.
+fn validate_session_setup(params: &Value) -> Result<(PathBuf, Option<Value>), String> {
     let cwd = params
         .get("cwd")
         .and_then(Value::as_str)
@@ -120,14 +121,15 @@ fn validate_session_setup(params: &Value) -> Result<PathBuf, String> {
     if !path.is_absolute() || !path.is_dir() {
         return Err("cwd must be an existing absolute directory".to_string());
     }
-    let servers = params
-        .get("mcpServers")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "mcpServers must be an array".to_string())?;
-    if !servers.is_empty() {
-        return Err("non-empty mcpServers are not supported by agy-acp".to_string());
-    }
-    Ok(path)
+    let mcp = crate::mcp::from_acp(params)?;
+    Ok((path, mcp))
+}
+
+/// `AGY_COMMAND` names the `agy` executable where the bridge's PATH does not hold it.
+pub(crate) fn agy_program() -> std::ffi::OsString {
+    std::env::var_os("AGY_COMMAND")
+        .filter(|command| !command.is_empty())
+        .unwrap_or_else(|| "agy".into())
 }
 
 fn split_model_entry(entry: &str) -> (&str, &str) {
@@ -312,6 +314,8 @@ pub struct Adapter {
     pub(crate) session_access: HashMap<String, u64>,
     pub(crate) next_access: u64,
     pub(crate) active_sessions: HashSet<String>,
+    /// Each resident session's MCP servers, in memory only: they can carry secrets, and ACP resends them on load and resume.
+    pub(crate) mcp_configs: HashMap<String, Value>,
 }
 
 impl Adapter {
@@ -332,10 +336,11 @@ impl Adapter {
             state_file: state_dir.join("sessions.json"),
             available_models: Self::fetch_available_models(),
             skip_naration,
-            command: CommandSpec::new("agy", Vec::new()),
+            command: CommandSpec::new(agy_program(), Vec::new()),
             session_access: HashMap::new(),
             next_access: 0,
             active_sessions: HashSet::new(),
+            mcp_configs: HashMap::new(),
         }
     }
 
@@ -351,7 +356,7 @@ impl Adapter {
             Ok(file) => file,
             Err(_) => return Vec::new(),
         };
-        let mut child = match Command::new("agy")
+        let mut child = match Command::new(agy_program())
             .arg("models")
             .stdout(Stdio::from(output_file))
             .stderr(Stdio::null())
@@ -619,6 +624,7 @@ impl Adapter {
             };
             self.sessions.remove(&victim);
             self.session_access.remove(&victim);
+            self.mcp_configs.remove(&victim);
         }
     }
 
@@ -643,6 +649,13 @@ impl Adapter {
             return Ok(None);
         };
         Ok(Some(session_from_stored(stored, cwd)))
+    }
+
+    fn set_mcp_config(&mut self, session_id: &str, mcp: Option<Value>) {
+        match mcp {
+            Some(config) => self.mcp_configs.insert(session_id.to_string(), config),
+            None => self.mcp_configs.remove(session_id),
+        };
     }
 
     fn install_candidate(&mut self, session_id: &str, candidate: Session) {
@@ -674,6 +687,7 @@ impl Adapter {
                 "agentInfo": { "name": "agy", "version": env!("CARGO_PKG_VERSION") },
                 "agentCapabilities": {
                     "loadSession": true,
+                    "mcpCapabilities": { "http": true, "sse": false },
                     "sessionCapabilities": { "resume": {} },
                 },
                 "authMethods": [],
@@ -683,8 +697,8 @@ impl Adapter {
     }
 
     pub fn handle_session_new(&mut self, id: Value, params: &Value) -> JsonRpcResponse {
-        let cwd = match validate_session_setup(params) {
-            Ok(cwd) => cwd,
+        let (cwd, mcp) = match validate_session_setup(params) {
+            Ok(setup) => setup,
             Err(message) => return JsonRpcResponse::error(id, -32602, &message),
         };
         let session_id = Uuid::new_v4().to_string();
@@ -698,6 +712,7 @@ impl Adapter {
             return persistence_error(id);
         }
         self.install_candidate(&session_id, candidate);
+        self.set_mcp_config(&session_id, mcp);
         let result = self.session_config_result_json(&session_id, None);
         JsonRpcResponse::success(id, result)
     }
@@ -715,8 +730,8 @@ impl Adapter {
             .unwrap()];
         };
 
-        let cwd = match validate_session_setup(params) {
-            Ok(cwd) => cwd,
+        let (cwd, mcp) = match validate_session_setup(params) {
+            Ok(setup) => setup,
             Err(message) => {
                 return vec![
                     serde_json::to_string(&JsonRpcResponse::error(id, -32602, &message)).unwrap(),
@@ -768,6 +783,7 @@ impl Adapter {
             return vec![serde_json::to_string(&persistence_error(id)).unwrap()];
         }
         self.install_candidate(session_id, candidate.clone());
+        self.set_mcp_config(session_id, mcp);
 
         let mut output_lines: Vec<String> = Vec::new();
         if let Some((updates, _)) = replay {
@@ -811,8 +827,8 @@ impl Adapter {
             };
         };
 
-        let cwd = match validate_session_setup(params) {
-            Ok(cwd) => cwd,
+        let (cwd, mcp) = match validate_session_setup(params) {
+            Ok(setup) => setup,
             Err(message) => return JsonRpcResponse::error(id, -32602, &message),
         };
 
@@ -837,6 +853,7 @@ impl Adapter {
         }
         let result = self.session_config_result_json(session_id, candidate.model_id.as_deref());
         self.install_candidate(session_id, candidate);
+        self.set_mcp_config(session_id, mcp);
         JsonRpcResponse {
             jsonrpc: "2.0",
             id,
@@ -989,6 +1006,7 @@ impl Adapter {
         let conversation_id = session.conversation_id.clone();
         let model_id = session.model_id.clone();
         let initial_step_idx = session.last_step_idx;
+        let mcp_config = self.mcp_configs.get(session_id).cloned();
 
         let state_dir = self
             .state_file
@@ -1016,6 +1034,7 @@ impl Adapter {
             state_dir,
             skip_naration: self.skip_naration,
             command: self.command.clone(),
+            mcp_config,
         })
     }
 

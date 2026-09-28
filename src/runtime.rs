@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::adapter::Adapter;
+use crate::mcp::RunConfig;
 use crate::output::{self, OutputSender};
 use crate::protocol::{parse_jsonrpc_line, IncomingMessage, RpcCall};
 use crate::streaming::poll_streaming_delta;
@@ -345,6 +346,7 @@ pub(crate) async fn execute_prompt(
         state_dir,
         skip_naration,
         command,
+        mcp_config,
     } = execution;
     let run_logs_dir = state_dir.join("run-logs");
     let run_log_path = run_logs_dir.join(format!("{}.log", Uuid::new_v4()));
@@ -377,6 +379,32 @@ pub(crate) async fn execute_prompt(
         };
         args.extend(extra_args);
     }
+    // Held until the run ends: `agy` may start an MCP server at any point of its turn.
+    let _mcp_run = match mcp_config
+        .as_ref()
+        .map(|config| RunConfig::write(config, &state_dir))
+    {
+        None => None,
+        Some(Ok(run)) => {
+            args.push("--add-dir".into());
+            args.push(run.dir().as_os_str().to_os_string());
+            Some(run)
+        }
+        Some(Err(error)) => {
+            return PromptOutcome {
+                session_id,
+                conversation_id,
+                last_step_idx: initial_step_idx,
+                response: JsonRpcResponse::error(
+                    id,
+                    -32000,
+                    &format!("failed to write the session's MCP configuration: {error}"),
+                ),
+                run_log_path,
+                remove_run_log_on_commit: false,
+            };
+        }
+    };
     if let Some(conv_id) = &conversation_id {
         args.push("--conversation".into());
         args.push(conv_id.into());

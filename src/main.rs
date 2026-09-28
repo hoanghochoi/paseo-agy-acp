@@ -1,5 +1,6 @@
 mod adapter;
 mod db;
+mod mcp;
 mod output;
 mod protobuf;
 mod protocol;

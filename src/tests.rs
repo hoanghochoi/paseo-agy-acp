@@ -1440,7 +1440,11 @@ fn write_models_stub(bin_dir: &std::path::Path, body: &str) {
 const WINDOWS_FAKE_AGY_SCRIPT: &str = r#"
 $logFile = $null
 $prompt = $null
+$addDirs = @()
 for ($i = 0; $i -lt $args.Count; $i++) {
+    if (($args[$i] -eq '--add-dir') -and (($i + 1) -lt $args.Count)) {
+        $addDirs += $args[$i + 1]
+    }
     if (($null -eq $logFile) -and ($args[$i] -eq '--log-file') -and (($i + 1) -lt $args.Count)) {
         $logFile = $args[$i + 1]
     }
@@ -1449,6 +1453,10 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     }
 }
 Set-Content -LiteralPath $logFile -Value 'Created conversation 00000000-0000-4000-8000-000000000099' -Encoding utf8
+foreach ($dir in $addDirs) {
+    $config = Join-Path $dir '.agents\mcp_config.json'
+    if (Test-Path -LiteralPath $config) { Copy-Item -LiteralPath $config -Destination ($logFile + '.mcp') }
+}
 if ($prompt -eq 'slow') { Start-Sleep -Milliseconds 3000 }
 if ($prompt -eq 'tree') {
     $descendant = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30' -PassThru
@@ -1468,8 +1476,14 @@ if ($prompt -eq 'huge') { [Console]::Out.Write('x' * 5000000); exit 0 }
 const UNIX_FAKE_AGY_SCRIPT: &str = r#"#!/bin/sh
 log_file=''
 prompt=''
+add_dirs=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --add-dir)
+      if [ "$#" -gt 1 ]; then add_dirs="$add_dirs
+$2"; fi
+      shift
+      ;;
     --log-file)
       if [ -z "$log_file" ] && [ "$#" -gt 1 ]; then log_file="$2"; fi
       shift
@@ -1482,6 +1496,9 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 printf '%s\n' 'Created conversation 00000000-0000-4000-8000-000000000099' > "$log_file"
+printf '%s\n' "$add_dirs" | while IFS= read -r dir; do
+  if [ -n "$dir" ] && [ -f "$dir/.agents/mcp_config.json" ]; then cp "$dir/.agents/mcp_config.json" "$log_file.mcp"; fi
+done
 if [ "$prompt" = 'slow' ]; then
   printf '%s\n' 'fake assistant response'
   exec sleep 3
@@ -1934,6 +1951,7 @@ fn test_adapter(root: &std::path::Path) -> Adapter {
         session_access: HashMap::new(),
         next_access: 0,
         active_sessions: std::collections::HashSet::new(),
+        mcp_configs: HashMap::new(),
     }
 }
 
@@ -2425,18 +2443,128 @@ fn session_new_rejects_non_array_mcp_servers() {
     assert_eq!(response.error.as_ref().unwrap()["code"], -32602);
 }
 
+fn mcp_session_params(cwd: &std::path::Path) -> Value {
+    json!({
+        "cwd": cwd.to_string_lossy(),
+        "mcpServers": [
+            {
+                "name": "desk",
+                "command": "node",
+                "args": ["desk.mjs"],
+                "env": [{"name": "DESK_TOKEN", "value": "MCP_ENV_SECRET_SENTINEL"}],
+            },
+            {
+                "type": "http",
+                "name": "remote",
+                "url": "https://example.com/mcp",
+                "headers": [{"name": "Authorization", "value": "Bearer MCP_HEADER_SECRET_SENTINEL"}],
+            },
+        ],
+    })
+}
+
+fn agy_mcp_config() -> Value {
+    json!({
+        "mcpServers": {
+            "desk": {
+                "command": "node",
+                "args": ["desk.mjs"],
+                "env": {"DESK_TOKEN": "MCP_ENV_SECRET_SENTINEL"},
+            },
+            "remote": {
+                "serverUrl": "https://example.com/mcp",
+                "headers": {"Authorization": "Bearer MCP_HEADER_SECRET_SENTINEL"},
+            },
+        },
+    })
+}
+
 #[test]
-fn session_new_rejects_non_empty_mcp_servers() {
-    // Break caught: silently claiming support for MCP servers that are never forwarded.
-    let root = fresh_test_root("mcp");
+fn session_mcp_servers_are_held_in_agy_shape_in_memory_only_and_replaced_on_resume() {
+    // Break caught: dropping a seat's MCP servers, or persisting their secrets in the session store.
+    let root = fresh_test_root("mcp-held");
     let cwd = root.join("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut adapter = test_adapter(&root);
-    let response = adapter.handle_session_new(
-        json!(1),
-        &json!({"cwd": cwd.to_string_lossy(), "mcpServers": [{"type": "stdio"}]}),
-    );
-    assert_eq!(response.error.as_ref().unwrap()["code"], -32602);
+    let response = adapter.handle_session_new(json!(1), &mcp_session_params(&cwd));
+    let session_id = response.result.unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(adapter.mcp_configs[&session_id], agy_mcp_config());
+    let stored = fs::read_to_string(&adapter.state_file).unwrap();
+    assert!(!stored.contains("MCP_ENV_SECRET_SENTINEL"));
+    assert!(!stored.contains("MCP_HEADER_SECRET_SENTINEL"));
+
+    let resumed =
+        adapter.handle_session_resume(json!(2), &session_lifecycle_params(&session_id, &cwd));
+    assert!(resumed.error.is_none());
+    assert!(!adapter.mcp_configs.contains_key(&session_id));
+}
+
+#[test]
+fn session_new_rejects_mcp_servers_agy_cannot_run() {
+    // Break caught: accepting a server agy would silently never start.
+    let root = fresh_test_root("mcp-rejected");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    for servers in [
+        json!([{"type": "sse", "name": "events", "url": "https://example.com/sse", "headers": []}]),
+        json!([{"type": "stdio"}]),
+        json!([{"name": "twice", "command": "a"}, {"name": "twice", "command": "b"}]),
+        json!([{"name": "env", "command": "a", "env": [{"name": "X", "value": 1}]}]),
+    ] {
+        let response = adapter.handle_session_new(
+            json!(1),
+            &json!({"cwd": cwd.to_string_lossy(), "mcpServers": servers}),
+        );
+        assert_eq!(
+            response.error.as_ref().unwrap()["code"],
+            -32602,
+            "{servers}"
+        );
+    }
+    assert!(adapter.mcp_configs.is_empty());
+}
+
+#[tokio::test]
+async fn prompt_run_hands_agy_the_session_mcp_config_through_an_added_dir_and_removes_it() {
+    // Break caught: MCP servers accepted at session setup but never reaching agy, or their config outliving the run.
+    let root = fresh_test_root("mcp-run");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut adapter = test_adapter(&root);
+    adapter.command = fake_agy_command(&root);
+    let response = adapter.handle_session_new(json!(1), &mcp_session_params(&cwd));
+    let session_id = response.result.unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let execution = adapter
+        .prepare_prompt(
+            json!(2),
+            &json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "hi"}]}),
+        )
+        .unwrap();
+    let (output, _receiver) = crate::output::channel();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::runtime::execute_prompt(execution, Arc::new(AtomicBool::new(false)), output),
+    )
+    .await
+    .expect("fake agy did not finish");
+
+    let mut seen = outcome.run_log_path.clone().into_os_string();
+    seen.push(".mcp");
+    let seen: Value = serde_json::from_str(&fs::read_to_string(&seen).unwrap()).unwrap();
+    assert_eq!(seen, agy_mcp_config());
+    let left = fs::read_dir(root.join("state").join("mcp"))
+        .unwrap()
+        .count();
+    assert_eq!(left, 0);
 }
 
 #[test]
@@ -3461,6 +3589,16 @@ fn test_initialize_advertises_load_session_support() {
             .and_then(|c| c.get("loadSession"))
             .and_then(|v| v.as_bool()),
         Some(true)
+    );
+}
+
+#[test]
+fn initialize_advertises_the_mcp_transports_agy_runs() {
+    let adapter = Adapter::new();
+    let response = adapter.handle_initialize(json!(1));
+    assert_eq!(
+        response.result.unwrap()["agentCapabilities"]["mcpCapabilities"],
+        json!({"http": true, "sse": false})
     );
 }
 

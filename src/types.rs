@@ -107,6 +107,8 @@ pub(crate) struct PromptExecution {
     pub state_dir: PathBuf,
     pub skip_naration: bool,
     pub command: CommandSpec,
+    /// The session's MCP servers in Antigravity's shape, written for this run only.
+    pub mcp_config: Option<Value>,
 }
 
 #[cfg(test)]

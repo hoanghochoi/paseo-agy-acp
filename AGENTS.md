@@ -45,6 +45,7 @@ GitHub Actions runs the format, Clippy, unit/I/O test, and release-build gates o
 
 | Var | Effect |
 |---|---|
+| `AGY_COMMAND` | The `agy` executable for model discovery and prompt runs, where the bridge's PATH does not hold it (default `agy`) |
 | `AGY_EXTRA_ARGS` | Space-separated extra args passed to every `agy` invocation |
 | `AGY_PRINT_TIMEOUT` | Override the bridge-owned `agy --print-timeout` (default `24h`) |
 | `AGY_MODEL_DISCOVERY_TIMEOUT_MS` | Override the `agy models` discovery deadline in milliseconds (default `30000`, capped at `120000`) |
@@ -61,6 +62,8 @@ GitHub Actions runs the format, Clippy, unit/I/O test, and release-build gates o
 - Final-answer recovery: SQLite provides streaming/tool/history updates, while captured `agy --print` stdout is the fallback when SQLite emitted no assistant text. A successful process with no conversation ID or no assistant response fails closed instead of returning an empty `end_turn`.
 - Turn completion: the bridge raises `agy --print-timeout` to 24 hours by default and treats an observed print timeout or any non-zero `agy` exit as a failed ACP turn, even if partial updates were streamed. It never converts either condition into `end_turn`.
 - `fetch_available_models()` runs `agy models` synchronously during `Adapter::new()` with a 30-second default deadline (override with `AGY_MODEL_DISCOVERY_TIMEOUT_MS`, capped at 120 seconds). If `agy` isn't installed, times out, or exits unsuccessfully, the models list is empty (no error).
+- MCP servers: `session/new`, `session/load` and `session/resume` accept ACP `mcpServers` (stdio and http; sse fails closed) and keep them in memory only, never in `sessions.json`, since they can carry secrets; each lifecycle call replaces them. A prompt run writes them to `<state>/mcp/<uuid>/.agents/mcp_config.json`, passes that folder with `--add-dir` (agy reads `.agents/mcp_config.json` from every workspace folder), and removes it when the run ends; folders older than 48 hours are pruned. The global `~/.gemini/config/mcp_config.json` and the session's cwd are never touched.
+- Print mode soft-denies every tool call that needs confirmation, MCP tools included. A tool is allowed only by a `permissions.allow` rule such as `mcp(<server>/*)` in `~/.gemini/antigravity-cli/settings.json`, or by `--dangerously-skip-permissions`; a workspace `.agents/settings.json` is not read for permissions.
 - `session/cancel` marks the active prompt cancelled; on Windows the adapter terminates the child process tree before returning the cancelled response.
 - Both `session/set_model` and `session/setConfigOption` are accepted for model selection.
 - Runtime input and output are bounded: JSON-RPC frames (1 MiB), prompt text (256 KiB), `AGY_EXTRA_ARGS` (64 KiB), model discovery output (256 KiB), child stdout (4 MiB), SQLite step payloads (1 MiB), and SQLite rows per poll (256). Oversized data fails closed or advances the cursor without retaining the payload.
