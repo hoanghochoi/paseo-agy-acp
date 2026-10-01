@@ -3304,6 +3304,33 @@ fn test_extract_tool_update_from_bash_tool() {
 }
 
 #[test]
+fn test_extract_tool_update_from_agy_1_2_13_tool_step() {
+    let input = r#"{"CommandLine":"git status","Cwd":"/tmp/project","toolAction":"Checking status","toolSummary":"Git status check"}"#;
+    let mut call = Vec::new();
+    push_len_field(&mut call, 1, b"call_1052510");
+    push_len_field(&mut call, 2, b"run_command");
+    push_len_field(&mut call, 3, input.as_bytes());
+    let mut tool = Vec::new();
+    push_varint_field(&mut tool, 3, 2);
+    push_len_field(&mut tool, 4, &call);
+    let mut task = Vec::new();
+    push_len_field(&mut task, 4, b"git status");
+    push_len_field(&mut task, 7, b"Git status check");
+    let mut payload = Vec::new();
+    push_varint_field(&mut payload, 1, 132);
+    push_varint_field(&mut payload, 4, 3);
+    push_len_field(&mut payload, 5, &tool);
+    push_len_field(&mut payload, 148, &task);
+
+    assert!(is_tool_step_type(132));
+    let update = extract_tool_update_from_step_payload(2, 132, &payload).unwrap();
+    assert_eq!(update["toolCallId"], "call_1052510");
+    assert_eq!(update["kind"], "execute");
+    assert_eq!(update["title"], "Git status check");
+    assert_eq!(update["rawInput"]["CommandLine"], "git status");
+}
+
+#[test]
 fn test_extract_tool_update_from_web_search_step() {
     let payload = br#"
         search_web
